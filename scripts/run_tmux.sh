@@ -36,7 +36,7 @@ tmux new-session -d -s "$SESSION_NAME" \
   "cd '$APP_DIR' && \
    source '$VENV_DIR/bin/activate' && \
    set -a && source .env && set +a && \
-   exec uvicorn app:app --host '$HOST' --port '$PORT'"
+   exec '$VENV_DIR/bin/uvicorn' app:app --host '$HOST' --port '$PORT'"
 
 echo "Started OmniVoice API in tmux session '$SESSION_NAME' on $HOST:$PORT"
 echo "Attach logs: tmux attach -t $SESSION_NAME"

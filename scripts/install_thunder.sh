@@ -11,10 +11,11 @@ python -m pip install -r requirements.txt
 
 if command -v sudo >/dev/null 2>&1; then
   sudo apt-get update
-  sudo apt-get install -y ffmpeg
+  sudo apt-get install -y ffmpeg tmux
 else
   apt-get update
-  apt-get install -y ffmpeg
+  apt-get install -y ffmpeg tmux
 fi
 
 echo "Installed OmniVoice API dependencies in $VENV_DIR"
+echo "Installed system packages: ffmpeg tmux"
