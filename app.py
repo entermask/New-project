@@ -122,7 +122,7 @@ def _write_transcript(ref_audio_url: str, transcript: str) -> None:
     if not transcript:
         return
     path = _transcript_cache_path(ref_audio_url)
-    tmp_path = path.with_suffix(".json.tmp")
+    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     payload = {
         "ref_audio_url": ref_audio_url,
         "transcript": transcript,
