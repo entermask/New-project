@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -46,12 +47,14 @@ MAX_CONCURRENCY = int(os.getenv("OMNIVOICE_CONCURRENCY", "4"))
 DOWNLOAD_TIMEOUT = float(os.getenv("OMNIVOICE_DOWNLOAD_TIMEOUT", "60"))
 REQUEST_TIMEOUT = float(os.getenv("OMNIVOICE_REQUEST_TIMEOUT", "300"))
 JOB_TTL_SECONDS = int(os.getenv("OMNIVOICE_JOB_TTL_SECONDS", "3600"))
+MAX_INFLIGHT_JOBS = max(1, int(os.getenv("OMNIVOICE_MAX_INFLIGHT_JOBS", "20")))
 SKIP_MODEL_LOAD = os.getenv("OMNIVOICE_SKIP_MODEL_LOAD", "0") == "1"
 ACCELERATION = os.getenv("OMNIVOICE_ACCELERATION", "base").lower().strip()
 ENABLE_BATCHING = os.getenv("OMNIVOICE_ENABLE_BATCHING", "1") == "1"
 BATCH_SIZE = max(1, int(os.getenv("OMNIVOICE_BATCH_SIZE", str(MAX_CONCURRENCY))))
 BATCH_MAX_WAIT_MS = max(0.0, float(os.getenv("OMNIVOICE_BATCH_MAX_WAIT_MS", "100")))
 BATCH_QUEUE_SIZE = max(1, int(os.getenv("OMNIVOICE_BATCH_QUEUE_SIZE", "256")))
+BATCH_TEXT_LENGTH_THRESHOLD = max(1, int(os.getenv("OMNIVOICE_BATCH_TEXT_LENGTH_THRESHOLD", "100")))
 
 SUPPORTED_FORMATS = {"wav", "mp3"}
 SUPPORTED_ACCELERATIONS = {"base", "triton", "hybrid"}
@@ -68,6 +71,7 @@ model_loaded = False
 generation_semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
 generation_queue: asyncio.Queue["BatchGenerationItem"] = asyncio.Queue(maxsize=BATCH_QUEUE_SIZE)
 generation_batch_worker_task: Optional[asyncio.Task] = None
+deferred_generation_items: deque["BatchGenerationItem"] = deque()
 active_requests = 0
 active_generations = 0
 active_generation_batches = 0
@@ -402,6 +406,7 @@ async def _get_runtime_metrics() -> dict[str, object]:
             "active_generations": active_generations,
             "active_generation_batches": active_generation_batches,
             "queued_generations": queued_generations,
+            "deferred_generation_items": len(deferred_generation_items),
             "max_concurrency": MAX_CONCURRENCY,
             "generation_capacity": generation_capacity,
             "available_generation_slots": max(generation_capacity - active_generations, 0),
@@ -409,31 +414,70 @@ async def _get_runtime_metrics() -> dict[str, object]:
             "batch_size": BATCH_SIZE,
             "batch_max_wait_ms": BATCH_MAX_WAIT_MS,
             "batch_queue_size": BATCH_QUEUE_SIZE,
+            "batch_text_length_threshold": BATCH_TEXT_LENGTH_THRESHOLD,
+            "max_inflight_jobs": MAX_INFLIGHT_JOBS,
             "tts_jobs": job_counts,
         }
 
 
-def _batch_generation_key(item: BatchGenerationItem) -> tuple[int]:
-    return (item.req.num_step,)
+def _inflight_job_count_locked() -> int:
+    return sum(1 for job in tts_jobs.values() if job.status in {"queued", "running"})
+
+
+def _text_length_bucket(text: str) -> str:
+    if len(text.strip()) < BATCH_TEXT_LENGTH_THRESHOLD:
+        return "short"
+    return "long"
+
+
+def _batch_generation_key(item: BatchGenerationItem) -> tuple[int, Optional[float], Optional[str], str]:
+    return (
+        item.req.num_step,
+        item.req.speed,
+        item.req.language,
+        _text_length_bucket(item.req.text),
+    )
 
 
 def _group_batch_items(items: list[BatchGenerationItem]) -> list[list[BatchGenerationItem]]:
-    groups: dict[tuple[int], list[BatchGenerationItem]] = {}
+    groups: dict[tuple[int, Optional[float], Optional[str], str], list[BatchGenerationItem]] = {}
     for item in items:
         groups.setdefault(_batch_generation_key(item), []).append(item)
     return list(groups.values())
 
 
+def _take_deferred_generation_item(
+    key: Optional[tuple[int, Optional[float], Optional[str], str]] = None,
+) -> Optional[BatchGenerationItem]:
+    if not deferred_generation_items:
+        return None
+    for index, item in enumerate(deferred_generation_items):
+        if key is None or _batch_generation_key(item) == key:
+            del deferred_generation_items[index]
+            return item
+    return None
+
+
 async def _collect_generation_batch(first_item: BatchGenerationItem) -> list[BatchGenerationItem]:
     batch = [first_item]
+    batch_key = _batch_generation_key(first_item)
     deadline = asyncio.get_running_loop().time() + (BATCH_MAX_WAIT_MS / 1000)
 
     while len(batch) < BATCH_SIZE:
+        deferred_match = _take_deferred_generation_item(batch_key)
+        if deferred_match is not None:
+            batch.append(deferred_match)
+            continue
+
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
             break
         try:
-            batch.append(await asyncio.wait_for(generation_queue.get(), timeout=remaining))
+            candidate = await asyncio.wait_for(generation_queue.get(), timeout=remaining)
+            if _batch_generation_key(candidate) == batch_key:
+                batch.append(candidate)
+            else:
+                deferred_generation_items.append(candidate)
         except TimeoutError:
             break
 
@@ -474,7 +518,9 @@ async def _run_generation_batch(items: list[BatchGenerationItem]) -> None:
 
 async def _generation_batch_worker() -> None:
     while True:
-        first_item = await generation_queue.get()
+        first_item = _take_deferred_generation_item()
+        if first_item is None:
+            first_item = await generation_queue.get()
         batch = await _collect_generation_batch(first_item)
         for group in _group_batch_items(batch):
             await _run_generation_batch(group)
@@ -743,6 +789,17 @@ async def tts(
         format=req.format,
     )
     async with tts_jobs_lock:
+        inflight_jobs = _inflight_job_count_locked()
+        if inflight_jobs >= MAX_INFLIGHT_JOBS:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Too many in-flight TTS jobs; limit is {MAX_INFLIGHT_JOBS}.",
+                headers={
+                    "Retry-After": "1",
+                    "X-Max-Inflight-Jobs": str(MAX_INFLIGHT_JOBS),
+                    "X-Inflight-Jobs": str(inflight_jobs),
+                },
+            )
         tts_jobs[request_id] = job
 
     background_tasks.add_task(_run_tts_job, request_id, req)
