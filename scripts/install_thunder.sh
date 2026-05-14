@@ -5,6 +5,10 @@ VENV_DIR="${VENV_DIR:-$HOME/venvs/omnivoice-api}"
 INSTALL_NVIDIA_DRIVER="${INSTALL_NVIDIA_DRIVER:-auto}"
 NVIDIA_DRIVER_VERSION="${NVIDIA_DRIVER_VERSION:-}"
 ALLOW_DEADSNAKES_PPA="${ALLOW_DEADSNAKES_PPA:-1}"
+CONFIGURE_UFW="${CONFIGURE_UFW:-1}"
+ENABLE_UFW="${ENABLE_UFW:-0}"
+APP_PORT="${APP_PORT:-8001}"
+SSH_PORT="${SSH_PORT:-22}"
 
 if command -v sudo >/dev/null 2>&1; then
   SUDO=(sudo)
@@ -57,7 +61,26 @@ install_python_312() {
 
 install_system_packages() {
   apt_update
-  apt_install ffmpeg tmux curl ca-certificates lsb-release build-essential gcc g++
+  apt_install ffmpeg tmux curl ca-certificates lsb-release build-essential gcc g++ ufw
+}
+
+configure_firewall() {
+  if [ "$CONFIGURE_UFW" = "0" ] || [ "$CONFIGURE_UFW" = "false" ]; then
+    echo "Skipping UFW configuration because CONFIGURE_UFW=$CONFIGURE_UFW"
+    return 0
+  fi
+
+  echo "Configuring UFW rules for SSH port $SSH_PORT and app port $APP_PORT..."
+  "${SUDO[@]}" ufw allow "$SSH_PORT/tcp"
+  "${SUDO[@]}" ufw allow "$APP_PORT/tcp"
+
+  if [ "$ENABLE_UFW" = "1" ] || [ "$ENABLE_UFW" = "true" ]; then
+    "${SUDO[@]}" ufw --force enable
+  else
+    echo "UFW rules added but firewall not enabled. To enable now, run: sudo ufw enable"
+  fi
+
+  "${SUDO[@]}" ufw status verbose || true
 }
 
 install_nvidia_driver_if_needed() {
@@ -88,6 +111,7 @@ install_nvidia_driver_if_needed() {
 }
 
 install_system_packages
+configure_firewall
 install_nvidia_driver_if_needed
 
 PYTHON="$(find_python || true)"
@@ -109,5 +133,5 @@ python -m pip install -U pip wheel
 python -m pip install -r requirements.txt
 
 echo "Installed OmniVoice API dependencies in $VENV_DIR"
-echo "Installed system packages: ffmpeg tmux curl ca-certificates lsb-release build-essential gcc g++"
+echo "Installed system packages: ffmpeg tmux curl ca-certificates lsb-release build-essential gcc g++ ufw"
 echo "Run service with: ./scripts/run_tmux.sh"
