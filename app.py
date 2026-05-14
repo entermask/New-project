@@ -54,7 +54,7 @@ BATCH_MAX_WAIT_MS = max(0.0, float(os.getenv("OMNIVOICE_BATCH_MAX_WAIT_MS", "100
 BATCH_QUEUE_SIZE = max(1, int(os.getenv("OMNIVOICE_BATCH_QUEUE_SIZE", "256")))
 
 SUPPORTED_FORMATS = {"wav", "mp3"}
-SUPPORTED_ACCELERATIONS = {"base", "hybrid"}
+SUPPORTED_ACCELERATIONS = {"base", "triton", "hybrid"}
 REF_AUDIO_DIR = CACHE_DIR / "ref-audio"
 TRANSCRIPT_DIR = CACHE_DIR / "transcripts"
 TMP_DIR = CACHE_DIR / "tmp"
@@ -63,6 +63,7 @@ JOB_DIR = CACHE_DIR / "jobs"
 
 app = FastAPI(title="OmniVoice API", version="1.0.0")
 model = None
+model_runner = None
 model_loaded = False
 generation_semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
 generation_queue: asyncio.Queue["BatchGenerationItem"] = asyncio.Queue(maxsize=BATCH_QUEUE_SIZE)
@@ -219,7 +220,7 @@ async def _resolve_reference(req: TTSRequest) -> ReferenceCacheEntry:
 
 
 def _load_model() -> None:
-    global model, model_loaded
+    global model, model_loaded, model_runner
     if SKIP_MODEL_LOAD:
         logger.warning("OMNIVOICE_SKIP_MODEL_LOAD=1; model loading is disabled.")
         model_loaded = False
@@ -238,17 +239,18 @@ def _load_model() -> None:
         DEVICE_MAP,
         ACCELERATION,
     )
-    if ACCELERATION == "hybrid":
+    if ACCELERATION in {"triton", "hybrid"}:
         from omnivoice_triton import create_runner
 
         runner = create_runner(
-            "hybrid",
+            ACCELERATION,
             device=DEVICE_MAP,
             model_id=MODEL_NAME,
             dtype="fp16",
         )
         runner.load_model()
         runner.model.load_asr_model(model_name=ASR_MODEL_NAME)
+        model_runner = runner
         model = runner.model
     else:
         from omnivoice import OmniVoice
