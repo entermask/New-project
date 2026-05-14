@@ -132,6 +132,8 @@ source "$VENV_DIR/bin/activate"
 python -m pip install -U pip wheel
 python -m pip install -r requirements.txt
 
+cp .env.example .env
+
 echo "Installed OmniVoice API dependencies in $VENV_DIR"
 echo "Installed system packages: ffmpeg tmux curl ca-certificates lsb-release build-essential gcc g++ ufw"
 echo "Run service with: ./scripts/run_tmux.sh"
