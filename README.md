@@ -15,8 +15,11 @@ Returns model, GPU, concurrency, and cache status.
   "gpu": "NVIDIA A100 80GB",
   "cache_audio_count": 12,
   "cache_transcript_count": 12,
+  "active_requests": 3,
   "active_generations": 1,
+  "queued_generations": 2,
   "max_concurrency": 4,
+  "available_generation_slots": 3,
   "acceleration": "base"
 }
 ```
@@ -38,6 +41,7 @@ Request:
   "ref_text": "Optional transcript",
   "language": "vi",
   "num_step": 32,
+  "speed": 1.1,
   "format": "mp3"
 }
 ```
@@ -47,10 +51,13 @@ Required fields: `text`, `ref_audio_url`.
 Defaults:
 
 ```text
-language=vi
+language omitted / null
 num_step=32
+speed omitted / null
 format=wav
 ```
+
+`speed` is optional. Values greater than `1.0` produce faster, shorter speech; values below `1.0` produce slower, longer speech.
 
 Supported formats: `wav`, `mp3`.
 
@@ -164,3 +171,31 @@ OMNIVOICE_SKIP_MODEL_LOAD=1 API_TOKEN=test ./scripts/run_local.sh
 ```
 
 The service returns silent WAV audio in this mode. MP3 still requires `ffmpeg`.
+
+## Benchmark
+
+Run from your local machine or from Thunder:
+
+```bash
+python scripts/benchmark_tts.py \
+  --base-url "https://<instance-uuid>-8001.thundercompute.net" \
+  --token "change-me" \
+  --ref-audio-url "https://example.com/ref.wav" \
+  --text "Xin chao, day la benchmark OmniVoice." \
+  --language vi \
+  --requests 20 \
+  --concurrency 4 \
+  --speed 1.1 \
+  --format mp3 \
+  --results-json benchmark.json \
+  --results-csv benchmark.csv
+```
+
+Compare WAV and MP3 with the same payload:
+
+```bash
+python scripts/benchmark_tts.py --base-url "$BASE_URL" --token "$API_TOKEN" --ref-audio-url "$REF_AUDIO_URL" --requests 20 --concurrency 4 --format wav
+python scripts/benchmark_tts.py --base-url "$BASE_URL" --token "$API_TOKEN" --ref-audio-url "$REF_AUDIO_URL" --requests 20 --concurrency 4 --format mp3
+```
+
+For hybrid acceleration, start with `OMNIVOICE_CONCURRENCY=1`, then benchmark `--concurrency 1`, `2`, and `4`.

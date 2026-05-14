@@ -70,6 +70,7 @@ class TTSRequest(BaseModel):
     ref_text: Optional[str] = None
     language: Optional[str] = None
     num_step: int = 32
+    speed: Optional[float] = None
     format: str = "wav"
 
 
@@ -237,12 +238,16 @@ def _generate_wav(req: TTSRequest, ref: ReferenceCacheEntry, output_path: Path) 
     if resolved_transcript:
         _write_transcript(req.ref_audio_url, resolved_transcript)
 
-    audios = model.generate(
-        text=req.text.strip(),
-        language=req.language or None,
-        voice_clone_prompt=voice_clone_prompt,
-        num_step=req.num_step,
-    )
+    generation_kwargs = {
+        "text": req.text.strip(),
+        "language": req.language or None,
+        "voice_clone_prompt": voice_clone_prompt,
+        "num_step": req.num_step,
+    }
+    if req.speed is not None:
+        generation_kwargs["speed"] = req.speed
+
+    audios = model.generate(**generation_kwargs)
     sf.write(str(output_path), audios[0], model.sampling_rate)
     return resolved_transcript or ""
 
@@ -377,6 +382,8 @@ def _validate_request(req: TTSRequest) -> None:
         raise HTTPException(status_code=400, detail="ref_audio_url must be http(s).")
     if req.num_step < 4 or req.num_step > 64:
         raise HTTPException(status_code=400, detail="num_step must be between 4 and 64.")
+    if req.speed is not None and (req.speed < 0.5 or req.speed > 2.0):
+        raise HTTPException(status_code=400, detail="speed must be between 0.5 and 2.0.")
 
 
 @app.on_event("startup")
