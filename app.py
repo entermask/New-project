@@ -56,8 +56,10 @@ app = FastAPI(title="OmniVoice API", version="1.0.0")
 model = None
 model_loaded = False
 generation_semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
+active_requests = 0
 active_generations = 0
-active_generations_lock = asyncio.Lock()
+queued_generations = 0
+metrics_lock = asyncio.Lock()
 cache_locks: dict[str, asyncio.Lock] = {}
 cache_locks_guard = asyncio.Lock()
 
@@ -66,7 +68,7 @@ class TTSRequest(BaseModel):
     text: str
     ref_audio_url: str
     ref_text: Optional[str] = None
-    language: Optional[str] = "vi"
+    language: Optional[str] = None
     num_step: int = 32
     format: str = "wav"
 
@@ -273,10 +275,40 @@ def _convert_wav_to_mp3(wav_path: Path, mp3_path: Path) -> None:
     )
 
 
+async def _metric_delta(name: str, delta: int) -> None:
+    global active_requests, active_generations, queued_generations
+    async with metrics_lock:
+        if name == "active_requests":
+            active_requests += delta
+        elif name == "active_generations":
+            active_generations += delta
+        elif name == "queued_generations":
+            queued_generations += delta
+        else:
+            raise ValueError(f"Unknown metric: {name}")
+
+
+async def _request_delta(delta: int) -> None:
+    await _metric_delta("active_requests", delta)
+
+
 async def _active_generation_delta(delta: int) -> None:
-    global active_generations
-    async with active_generations_lock:
-        active_generations += delta
+    await _metric_delta("active_generations", delta)
+
+
+async def _queued_generation_delta(delta: int) -> None:
+    await _metric_delta("queued_generations", delta)
+
+
+async def _get_runtime_metrics() -> dict[str, int]:
+    async with metrics_lock:
+        return {
+            "active_requests": active_requests,
+            "active_generations": active_generations,
+            "queued_generations": queued_generations,
+            "max_concurrency": MAX_CONCURRENCY,
+            "available_generation_slots": max(MAX_CONCURRENCY - active_generations, 0),
+        }
 
 
 async def _generate_response_audio(
@@ -287,15 +319,21 @@ async def _generate_response_audio(
 ) -> tuple[Path, str, str]:
     transcript = ref.transcript or ""
 
-    async with generation_semaphore:
-        await _active_generation_delta(1)
-        try:
-            if SKIP_MODEL_LOAD:
-                _write_silent_test_wav(output_wav)
-            else:
-                transcript = await asyncio.to_thread(_generate_wav, req, ref, output_wav)
-        finally:
-            await _active_generation_delta(-1)
+    await _queued_generation_delta(1)
+    try:
+        await generation_semaphore.acquire()
+    finally:
+        await _queued_generation_delta(-1)
+
+    await _active_generation_delta(1)
+    try:
+        if SKIP_MODEL_LOAD:
+            _write_silent_test_wav(output_wav)
+        else:
+            transcript = await asyncio.to_thread(_generate_wav, req, ref, output_wav)
+    finally:
+        await _active_generation_delta(-1)
+        generation_semaphore.release()
 
     if req.format == "mp3":
         output_mp3 = Path(tempfile.NamedTemporaryFile(delete=False, suffix=".mp3", dir=TMP_DIR).name)
@@ -358,15 +396,15 @@ async def health() -> dict[str, object]:
     except Exception:
         gpu = None
 
+    runtime_metrics = await _get_runtime_metrics()
     return {
         "status": "ok",
         "model_loaded": model_loaded,
         "gpu": gpu,
         "cache_audio_count": len(list(REF_AUDIO_DIR.glob("*"))),
         "cache_transcript_count": len(list(TRANSCRIPT_DIR.glob("*.json"))),
-        "active_generations": active_generations,
-        "max_concurrency": MAX_CONCURRENCY,
         "acceleration": ACCELERATION,
+        **runtime_metrics,
     }
 
 
@@ -376,6 +414,14 @@ async def tts(
     background_tasks: BackgroundTasks,
     _: None = Depends(_validate_token),
 ) -> Response:
+    await _request_delta(1)
+    try:
+        return await _tts(req, background_tasks)
+    finally:
+        await _request_delta(-1)
+
+
+async def _tts(req: TTSRequest, background_tasks: BackgroundTasks) -> Response:
     _validate_request(req)
     request_id = str(uuid.uuid4())
     ref = await _resolve_reference(req)
