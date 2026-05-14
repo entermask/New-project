@@ -57,7 +57,7 @@ install_python_312() {
 
 install_system_packages() {
   apt_update
-  apt_install ffmpeg tmux curl ca-certificates lsb-release
+  apt_install ffmpeg tmux curl ca-certificates lsb-release build-essential gcc g++
 }
 
 install_nvidia_driver_if_needed() {
@@ -109,5 +109,5 @@ python -m pip install -U pip wheel
 python -m pip install -r requirements.txt
 
 echo "Installed OmniVoice API dependencies in $VENV_DIR"
-echo "Installed system packages: ffmpeg tmux curl ca-certificates lsb-release"
+echo "Installed system packages: ffmpeg tmux curl ca-certificates lsb-release build-essential gcc g++"
 echo "Run service with: ./scripts/run_tmux.sh"
