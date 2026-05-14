@@ -2,20 +2,112 @@
 set -euo pipefail
 
 VENV_DIR="${VENV_DIR:-$HOME/venvs/omnivoice-api}"
+INSTALL_NVIDIA_DRIVER="${INSTALL_NVIDIA_DRIVER:-auto}"
+NVIDIA_DRIVER_VERSION="${NVIDIA_DRIVER_VERSION:-}"
+ALLOW_DEADSNAKES_PPA="${ALLOW_DEADSNAKES_PPA:-1}"
 
-python3 -m venv "$VENV_DIR"
+if command -v sudo >/dev/null 2>&1; then
+  SUDO=(sudo)
+else
+  SUDO=()
+fi
+
+apt_update() {
+  "${SUDO[@]}" apt-get update
+}
+
+apt_install() {
+  "${SUDO[@]}" apt-get install -y "$@"
+}
+
+python_is_312_plus() {
+  "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 12) else 1)' >/dev/null 2>&1
+}
+
+find_python() {
+  local candidate
+  for candidate in "${PYTHON_BIN:-}" python3.13 python3.12 python3; do
+    if [ -n "$candidate" ] && command -v "$candidate" >/dev/null 2>&1 && python_is_312_plus "$candidate"; then
+      command -v "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+install_python_312() {
+  echo "Python >=3.12 not found; installing Python 3.12..."
+  apt_update
+  if apt_install python3.12 python3.12-venv python3.12-dev; then
+    return 0
+  fi
+
+  if [ "$ALLOW_DEADSNAKES_PPA" = "1" ]; then
+    echo "python3.12 packages were not available; trying deadsnakes PPA..."
+    apt_install software-properties-common ca-certificates
+    "${SUDO[@]}" add-apt-repository -y ppa:deadsnakes/ppa
+    apt_update
+    apt_install python3.12 python3.12-venv python3.12-dev
+    return 0
+  fi
+
+  echo "Could not install Python 3.12. Use an Ubuntu 24.04+ image or set PYTHON_BIN=/path/to/python3.12." >&2
+  exit 1
+}
+
+install_system_packages() {
+  apt_update
+  apt_install ffmpeg tmux curl ca-certificates lsb-release
+}
+
+install_nvidia_driver_if_needed() {
+  if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+    echo "NVIDIA driver already works:"
+    nvidia-smi --query-gpu=name,driver_version --format=csv,noheader || true
+    return 0
+  fi
+
+  if [ "$INSTALL_NVIDIA_DRIVER" = "0" ] || [ "$INSTALL_NVIDIA_DRIVER" = "false" ]; then
+    echo "NVIDIA driver is not working, but INSTALL_NVIDIA_DRIVER=$INSTALL_NVIDIA_DRIVER; skipping."
+    return 0
+  fi
+
+  echo "NVIDIA driver not detected; installing Ubuntu NVIDIA driver packages..."
+  apt_update
+  apt_install ubuntu-drivers-common pciutils
+
+  if [ -n "$NVIDIA_DRIVER_VERSION" ]; then
+    apt_install "nvidia-driver-$NVIDIA_DRIVER_VERSION"
+  elif ubuntu-drivers install --help 2>/dev/null | grep -q -- "--gpgpu"; then
+    "${SUDO[@]}" ubuntu-drivers install --gpgpu
+  else
+    "${SUDO[@]}" ubuntu-drivers autoinstall
+  fi
+
+  echo "NVIDIA driver install finished. A reboot or instance restart may be required before nvidia-smi works."
+}
+
+install_system_packages
+install_nvidia_driver_if_needed
+
+PYTHON="$(find_python || true)"
+if [ -z "$PYTHON" ]; then
+  install_python_312
+  PYTHON="$(find_python || true)"
+fi
+
+if [ -z "$PYTHON" ]; then
+  echo "Python >=3.12 is still unavailable after install." >&2
+  exit 1
+fi
+
+echo "Using Python: $("$PYTHON" --version) at $PYTHON"
+"$PYTHON" -m venv "$VENV_DIR"
 source "$VENV_DIR/bin/activate"
 
 python -m pip install -U pip wheel
 python -m pip install -r requirements.txt
 
-if command -v sudo >/dev/null 2>&1; then
-  sudo apt-get update
-  sudo apt-get install -y ffmpeg tmux
-else
-  apt-get update
-  apt-get install -y ffmpeg tmux
-fi
-
 echo "Installed OmniVoice API dependencies in $VENV_DIR"
-echo "Installed system packages: ffmpeg tmux"
+echo "Installed system packages: ffmpeg tmux curl ca-certificates lsb-release"
+echo "Run service with: ./scripts/run_tmux.sh"
