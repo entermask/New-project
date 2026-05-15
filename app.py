@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 from collections import deque
@@ -79,6 +80,8 @@ queued_generations = 0
 metrics_lock = asyncio.Lock()
 cache_locks: dict[str, asyncio.Lock] = {}
 cache_locks_guard = asyncio.Lock()
+prompt_locks: dict[str, threading.Lock] = {}
+prompt_locks_guard = threading.Lock()
 tts_jobs: dict[str, "TTSJob"] = {}
 tts_jobs_lock = asyncio.Lock()
 
@@ -186,6 +189,15 @@ async def _get_cache_lock(key: str) -> asyncio.Lock:
         return lock
 
 
+def _get_prompt_lock(key: str) -> threading.Lock:
+    with prompt_locks_guard:
+        lock = prompt_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            prompt_locks[key] = lock
+        return lock
+
+
 async def _download_ref_audio(ref_audio_url: str, target: Path) -> None:
     tmp_target = target.with_suffix(f"{target.suffix}.tmp")
     async with httpx.AsyncClient(follow_redirects=True, timeout=DOWNLOAD_TIMEOUT) as client:
@@ -286,9 +298,23 @@ def _create_voice_clone_prompt(req: TTSRequest, ref: ReferenceCacheEntry) -> obj
     if model is None:
         raise RuntimeError("OmniVoice model is not loaded.")
 
+    ref_text = ref.transcript
+    if not ref_text:
+        lock = _get_prompt_lock(str(ref.audio_path))
+        with lock:
+            ref_text = _read_transcript(req.ref_audio_url)
+            voice_clone_prompt = model.create_voice_clone_prompt(
+                ref_audio=str(ref.audio_path),
+                ref_text=ref_text,
+            )
+            resolved_transcript = voice_clone_prompt.ref_text
+            if resolved_transcript:
+                _write_transcript(req.ref_audio_url, resolved_transcript)
+            return voice_clone_prompt
+
     voice_clone_prompt = model.create_voice_clone_prompt(
         ref_audio=str(ref.audio_path),
-        ref_text=ref.transcript,
+        ref_text=ref_text,
     )
     resolved_transcript = voice_clone_prompt.ref_text
     if resolved_transcript:
@@ -439,6 +465,10 @@ def _batch_generation_key(item: BatchGenerationItem) -> tuple[int, Optional[floa
     )
 
 
+def _batch_reference_key(item: BatchGenerationItem) -> tuple[tuple[int, Optional[float], Optional[str], str], str]:
+    return (_batch_generation_key(item), str(item.ref.audio_path))
+
+
 def _group_batch_items(items: list[BatchGenerationItem]) -> list[list[BatchGenerationItem]]:
     groups: dict[tuple[int, Optional[float], Optional[str], str], list[BatchGenerationItem]] = {}
     for item in items:
@@ -448,10 +478,16 @@ def _group_batch_items(items: list[BatchGenerationItem]) -> list[list[BatchGener
 
 def _take_deferred_generation_item(
     key: Optional[tuple[int, Optional[float], Optional[str], str]] = None,
+    reference_key: Optional[tuple[tuple[int, Optional[float], Optional[str], str], str]] = None,
 ) -> Optional[BatchGenerationItem]:
     if not deferred_generation_items:
         return None
     for index, item in enumerate(deferred_generation_items):
+        if reference_key is not None:
+            if _batch_reference_key(item) != reference_key:
+                continue
+        elif key is not None and _batch_generation_key(item) != key:
+            continue
         if key is None or _batch_generation_key(item) == key:
             del deferred_generation_items[index]
             return item
@@ -461,10 +497,11 @@ def _take_deferred_generation_item(
 async def _collect_generation_batch(first_item: BatchGenerationItem) -> list[BatchGenerationItem]:
     batch = [first_item]
     batch_key = _batch_generation_key(first_item)
+    reference_key = _batch_reference_key(first_item)
     deadline = asyncio.get_running_loop().time() + (BATCH_MAX_WAIT_MS / 1000)
 
     while len(batch) < BATCH_SIZE:
-        deferred_match = _take_deferred_generation_item(batch_key)
+        deferred_match = _take_deferred_generation_item(reference_key=reference_key)
         if deferred_match is not None:
             batch.append(deferred_match)
             continue
@@ -474,12 +511,18 @@ async def _collect_generation_batch(first_item: BatchGenerationItem) -> list[Bat
             break
         try:
             candidate = await asyncio.wait_for(generation_queue.get(), timeout=remaining)
-            if _batch_generation_key(candidate) == batch_key:
+            if _batch_reference_key(candidate) == reference_key:
                 batch.append(candidate)
             else:
                 deferred_generation_items.append(candidate)
         except TimeoutError:
             break
+
+    while len(batch) < BATCH_SIZE:
+        deferred_match = _take_deferred_generation_item(batch_key)
+        if deferred_match is None:
+            break
+        batch.append(deferred_match)
 
     return batch
 
