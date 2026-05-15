@@ -24,11 +24,11 @@ Common overrides:
 Matrix overrides, space-separated:
   MATRIX_ACCELERATIONS         Default: base triton
   MATRIX_CONCURRENCIES         Default: 4 6 8 12
-  MATRIX_STEPS                 Default: 16 32
+  MATRIX_STEPS                 Default: 32
   MATRIX_SPEEDS                Default: 1.0 1.1
 
 Example smoke test:
-  REQUESTS=2 MATRIX_CONCURRENCIES=4 MATRIX_STEPS=16 MATRIX_SPEEDS=1.1 MATRIX_ACCELERATIONS=base ./scripts/run_server_benchmark_report.sh
+  REQUESTS=2 MATRIX_CONCURRENCIES=4 MATRIX_SPEEDS=1.1 MATRIX_ACCELERATIONS=base ./scripts/run_server_benchmark_report.sh
 EOF
 }
 
@@ -59,7 +59,7 @@ RESTORE_SERVICE="${RESTORE_SERVICE:-1}"
 
 MATRIX_ACCELERATIONS="${MATRIX_ACCELERATIONS:-base triton}"
 MATRIX_CONCURRENCIES="${MATRIX_CONCURRENCIES:-4 6 8 12}"
-MATRIX_STEPS="${MATRIX_STEPS:-16 32}"
+MATRIX_STEPS="${MATRIX_STEPS:-32}"
 MATRIX_SPEEDS="${MATRIX_SPEEDS:-1.0 1.1}"
 
 ENV_FILE="$APP_DIR/.env"
