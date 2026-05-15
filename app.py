@@ -56,6 +56,8 @@ BATCH_SIZE = max(1, int(os.getenv("OMNIVOICE_BATCH_SIZE", str(MAX_CONCURRENCY)))
 BATCH_MAX_WAIT_MS = max(0.0, float(os.getenv("OMNIVOICE_BATCH_MAX_WAIT_MS", "100")))
 BATCH_QUEUE_SIZE = max(1, int(os.getenv("OMNIVOICE_BATCH_QUEUE_SIZE", "256")))
 BATCH_TEXT_LENGTH_THRESHOLD = max(1, int(os.getenv("OMNIVOICE_BATCH_TEXT_LENGTH_THRESHOLD", "100")))
+DEFERRED_MAX_SIZE = BATCH_QUEUE_SIZE * 2
+JOB_CLEANUP_INTERVAL_SECONDS = 60
 
 SUPPORTED_FORMATS = {"wav", "mp3"}
 SUPPORTED_ACCELERATIONS = {"base", "triton", "hybrid"}
@@ -72,7 +74,9 @@ model_loaded = False
 generation_semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
 generation_queue: asyncio.Queue["BatchGenerationItem"] = asyncio.Queue(maxsize=BATCH_QUEUE_SIZE)
 generation_batch_worker_task: Optional[asyncio.Task] = None
-deferred_generation_items: deque["BatchGenerationItem"] = deque()
+gpu_generation_semaphore = asyncio.Semaphore(1)
+deferred_generation_items: deque["BatchGenerationItem"] = deque(maxlen=DEFERRED_MAX_SIZE)
+job_cleanup_task: Optional[asyncio.Task] = None
 active_requests = 0
 active_generations = 0
 active_generation_batches = 0
@@ -338,6 +342,16 @@ def _generate_wav_batch(items: list[BatchGenerationItem]) -> list[str]:
     if model is None:
         raise RuntimeError("OmniVoice model is not loaded.")
 
+    unique_refs = len({str(item.ref.audio_path) for item in items})
+    logger.info(
+        "Batch generate: items=%d unique_refs=%d text_bucket=%s num_step=%d",
+        len(items),
+        unique_refs,
+        _text_length_bucket(items[0].req.text),
+        items[0].req.num_step,
+    )
+
+    prompt_start = time.monotonic()
     prompt_cache: dict[tuple[str, Optional[str]], object] = {}
     prompts = []
     for item in items:
@@ -347,13 +361,29 @@ def _generate_wav_batch(items: list[BatchGenerationItem]) -> list[str]:
             prompt = _create_voice_clone_prompt(item.req, item.ref)
             prompt_cache[cache_key] = prompt
         prompts.append(prompt)
+    prompt_elapsed = time.monotonic() - prompt_start
 
+    gen_start = time.monotonic()
     transcripts = [prompt.ref_text or "" for prompt in prompts]
     audios = model.generate(**_generation_kwargs([item.req for item in items], prompts))
+    gen_elapsed = time.monotonic() - gen_start
+
     if len(audios) != len(items):
         raise RuntimeError(f"OmniVoice returned {len(audios)} audios for {len(items)} requests.")
+
+    write_start = time.monotonic()
     for item, audio in zip(items, audios):
         sf.write(str(item.output_wav), audio, model.sampling_rate)
+    write_elapsed = time.monotonic() - write_start
+
+    logger.info(
+        "Batch done: items=%d prompt=%.1fms generate=%.1fms write=%.1fms prompt_cache_hits=%d",
+        len(items),
+        prompt_elapsed * 1000,
+        gen_elapsed * 1000,
+        write_elapsed * 1000,
+        len(items) - len(prompt_cache),
+    )
     return transcripts
 
 
@@ -465,10 +495,6 @@ def _batch_generation_key(item: BatchGenerationItem) -> tuple[int, Optional[floa
     )
 
 
-def _batch_reference_key(item: BatchGenerationItem) -> tuple[tuple[int, Optional[float], Optional[str], str], str]:
-    return (_batch_generation_key(item), str(item.ref.audio_path))
-
-
 def _group_batch_items(items: list[BatchGenerationItem]) -> list[list[BatchGenerationItem]]:
     groups: dict[tuple[int, Optional[float], Optional[str], str], list[BatchGenerationItem]] = {}
     for item in items:
@@ -478,52 +504,50 @@ def _group_batch_items(items: list[BatchGenerationItem]) -> list[list[BatchGener
 
 def _take_deferred_generation_item(
     key: Optional[tuple[int, Optional[float], Optional[str], str]] = None,
-    reference_key: Optional[tuple[tuple[int, Optional[float], Optional[str], str], str]] = None,
 ) -> Optional[BatchGenerationItem]:
     if not deferred_generation_items:
         return None
     for index, item in enumerate(deferred_generation_items):
-        if reference_key is not None:
-            if _batch_reference_key(item) != reference_key:
-                continue
-        elif key is not None and _batch_generation_key(item) != key:
+        if key is not None and _batch_generation_key(item) != key:
             continue
-        if key is None or _batch_generation_key(item) == key:
-            del deferred_generation_items[index]
-            return item
+        del deferred_generation_items[index]
+        return item
     return None
 
 
 async def _collect_generation_batch(first_item: BatchGenerationItem) -> list[BatchGenerationItem]:
     batch = [first_item]
     batch_key = _batch_generation_key(first_item)
-    reference_key = _batch_reference_key(first_item)
     deadline = asyncio.get_running_loop().time() + (BATCH_MAX_WAIT_MS / 1000)
 
-    while len(batch) < BATCH_SIZE:
-        deferred_match = _take_deferred_generation_item(reference_key=reference_key)
-        if deferred_match is not None:
-            batch.append(deferred_match)
-            continue
-
-        remaining = deadline - asyncio.get_running_loop().time()
-        if remaining <= 0:
-            break
-        try:
-            candidate = await asyncio.wait_for(generation_queue.get(), timeout=remaining)
-            if _batch_reference_key(candidate) == reference_key:
-                batch.append(candidate)
-            else:
-                deferred_generation_items.append(candidate)
-        except TimeoutError:
-            break
-
+    # Phase 1: Drain deferred items with matching batch key (instant, no waiting)
     while len(batch) < BATCH_SIZE:
         deferred_match = _take_deferred_generation_item(batch_key)
         if deferred_match is None:
             break
         batch.append(deferred_match)
 
+    # Phase 2: Wait for new items from queue up to deadline
+    while len(batch) < BATCH_SIZE:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            break
+        try:
+            candidate = await asyncio.wait_for(generation_queue.get(), timeout=remaining)
+            if _batch_generation_key(candidate) == batch_key:
+                batch.append(candidate)
+            else:
+                deferred_generation_items.append(candidate)
+        except TimeoutError:
+            break
+
+    logger.info(
+        "Batch collected: items=%d/%d key=%s deferred_remaining=%d",
+        len(batch),
+        BATCH_SIZE,
+        batch_key,
+        len(deferred_generation_items),
+    )
     return batch
 
 
@@ -538,7 +562,8 @@ async def _run_generation_batch(items: list[BatchGenerationItem]) -> None:
     await _active_generation_batch_delta(1)
     await _active_generation_delta(len(live_items))
     try:
-        transcripts = await asyncio.to_thread(_generate_wav_batch, live_items)
+        async with gpu_generation_semaphore:
+            transcripts = await asyncio.to_thread(_generate_wav_batch, live_items)
         if len(transcripts) != len(live_items):
             raise RuntimeError(
                 f"Batch generated {len(transcripts)} outputs for {len(live_items)} requests."
@@ -560,13 +585,23 @@ async def _run_generation_batch(items: list[BatchGenerationItem]) -> None:
 
 
 async def _generation_batch_worker() -> None:
+    current_tasks: list[asyncio.Task] = []
+
     while True:
+        # Collect next batch (runs concurrently with GPU generation of previous batch)
         first_item = _take_deferred_generation_item()
         if first_item is None:
             first_item = await generation_queue.get()
         batch = await _collect_generation_batch(first_item)
+
+        # Wait for previous batch to finish before dispatching new one
+        if current_tasks:
+            await asyncio.gather(*current_tasks, return_exceptions=True)
+            current_tasks.clear()
+
+        # Fire off new batch groups (gpu_generation_semaphore serializes GPU access)
         for group in _group_batch_items(batch):
-            await _run_generation_batch(group)
+            current_tasks.append(asyncio.create_task(_run_generation_batch(group)))
 
 
 async def _generate_response_audio_batched(
@@ -684,6 +719,17 @@ async def _cleanup_expired_jobs() -> None:
     for job in expired:
         if job.cleanup_paths:
             _remove_files(job.cleanup_paths)
+    if expired:
+        logger.info("Cleaned up %d expired TTS jobs.", len(expired))
+
+
+async def _periodic_job_cleanup() -> None:
+    while True:
+        await asyncio.sleep(JOB_CLEANUP_INTERVAL_SECONDS)
+        try:
+            await _cleanup_expired_jobs()
+        except Exception:
+            logger.exception("Error during periodic job cleanup")
 
 
 async def _run_tts_job(request_id: str, req: TTSRequest) -> None:
@@ -768,7 +814,7 @@ def _validate_request(req: TTSRequest) -> None:
 
 @app.on_event("startup")
 async def startup() -> None:
-    global generation_batch_worker_task
+    global generation_batch_worker_task, job_cleanup_task
     _ensure_dirs()
     await asyncio.to_thread(_load_model)
     if ENABLE_BATCHING and not SKIP_MODEL_LOAD:
@@ -779,6 +825,8 @@ async def startup() -> None:
             BATCH_MAX_WAIT_MS,
             BATCH_QUEUE_SIZE,
         )
+    job_cleanup_task = asyncio.create_task(_periodic_job_cleanup())
+    logger.info("Periodic job cleanup started (interval=%ds).", JOB_CLEANUP_INTERVAL_SECONDS)
 
 
 @app.on_event("shutdown")
@@ -821,7 +869,6 @@ async def tts(
     _: None = Depends(_validate_token),
 ) -> JSONResponse:
     _validate_request(req)
-    await _cleanup_expired_jobs()
     request_id = str(uuid.uuid4())
     now = time.time()
     job = TTSJob(
@@ -874,7 +921,6 @@ async def get_tts_job(
     request_id: str,
     _: None = Depends(_validate_token),
 ) -> JSONResponse:
-    await _cleanup_expired_jobs()
     async with tts_jobs_lock:
         job = tts_jobs.get(request_id)
         if job is None:
@@ -889,7 +935,6 @@ async def get_tts_job_audio(
     download: bool = Query(default=True),
     _: None = Depends(_validate_token),
 ) -> Response:
-    await _cleanup_expired_jobs()
     async with tts_jobs_lock:
         job = tts_jobs.get(request_id)
         if job is None:
