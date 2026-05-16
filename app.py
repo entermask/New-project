@@ -1038,6 +1038,8 @@ async def health() -> dict[str, object]:
     return {
         "status": "ok",
         "model_loaded": model_loaded,
+        "model": MODEL_NAME,
+        "asr_model": ASR_MODEL_NAME,
         "gpu": gpu,
         "gpu_profile": resolved_gpu_profile or _gpu_profile_from_name(gpu),
         "requested_gpu_profile": GPU_PROFILE,

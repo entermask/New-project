@@ -27,6 +27,7 @@ Common overrides:
   OMNIVOICE_BATCH_MAX_WAIT_MS  Default: 100 on A100/generic, 50 on H100
 
 Matrix overrides, space-separated:
+  MATRIX_MODELS                Default: k2-fsa/OmniVoice
   MATRIX_ACCELERATIONS         Default: base triton
   MATRIX_CONCURRENCIES         A100 default: 4 6 8 12; H100 default: 8 12 16 24 32
   MATRIX_DTYPES                A100/H100 default: fp16 bf16
@@ -35,6 +36,9 @@ Matrix overrides, space-separated:
 
 Example smoke test:
   REQUESTS=2 GPU_PROFILE=h100 MATRIX_CONCURRENCIES=16 MATRIX_DTYPES=fp16 MATRIX_SPEEDS=1.1 MATRIX_ACCELERATIONS=base ./scripts/run_server_benchmark_report.sh
+
+Compare official and BF16-converted checkpoints:
+  MATRIX_MODELS="k2-fsa/OmniVoice drbaph/OmniVoice-bf16" MATRIX_DTYPES="bf16" ./scripts/run_server_benchmark_report.sh
 EOF
 }
 
@@ -107,6 +111,7 @@ case "$PROFILE_FOR_MATRIX" in
 esac
 
 if [[ -z "${MATRIX_ACCELERATIONS+x}" ]]; then MATRIX_ACCELERATIONS="base triton"; fi
+if [[ -z "${MATRIX_MODELS+x}" ]]; then MATRIX_MODELS="k2-fsa/OmniVoice"; fi
 if [[ -z "${MATRIX_CONCURRENCIES+x}" ]]; then MATRIX_CONCURRENCIES="$DEFAULT_CONCURRENCIES"; fi
 if [[ -z "${MATRIX_DTYPES+x}" ]]; then MATRIX_DTYPES="$DEFAULT_DTYPES"; fi
 if [[ -z "${MATRIX_STEPS+x}" ]]; then MATRIX_STEPS="16 32"; fi
@@ -205,6 +210,7 @@ write_case_env() {
   local acceleration="$1"
   local concurrency="$2"
   local dtype="$3"
+  local model_id="$4"
   local max_inflight="${OMNIVOICE_MAX_INFLIGHT_JOBS:-}"
   local queue_size="${OMNIVOICE_BATCH_QUEUE_SIZE:-}"
   local batch_wait_ms="${OMNIVOICE_BATCH_MAX_WAIT_MS:-$DEFAULT_BATCH_MAX_WAIT_MS}"
@@ -222,9 +228,10 @@ write_case_env() {
     fi
   fi
 
-  grep -Ev '^(OMNIVOICE_ACCELERATION|OMNIVOICE_CONCURRENCY|OMNIVOICE_BATCH_SIZE|OMNIVOICE_BATCH_MAX_WAIT_MS|OMNIVOICE_BATCH_QUEUE_SIZE|OMNIVOICE_MAX_INFLIGHT_JOBS|OMNIVOICE_ENABLE_BATCHING|OMNIVOICE_SKIP_MODEL_LOAD|OMNIVOICE_GPU_PROFILE|OMNIVOICE_DTYPE|API_TOKEN)=' "$ENV_BACKUP" > "$ENV_FILE" || true
+  grep -Ev '^(OMNIVOICE_MODEL|OMNIVOICE_ACCELERATION|OMNIVOICE_CONCURRENCY|OMNIVOICE_BATCH_SIZE|OMNIVOICE_BATCH_MAX_WAIT_MS|OMNIVOICE_BATCH_QUEUE_SIZE|OMNIVOICE_MAX_INFLIGHT_JOBS|OMNIVOICE_ENABLE_BATCHING|OMNIVOICE_SKIP_MODEL_LOAD|OMNIVOICE_GPU_PROFILE|OMNIVOICE_DTYPE|API_TOKEN)=' "$ENV_BACKUP" > "$ENV_FILE" || true
   {
     printf 'API_TOKEN=%q\n' "$API_TOKEN"
+    printf 'OMNIVOICE_MODEL=%q\n' "$model_id"
     printf 'OMNIVOICE_GPU_PROFILE=%q\n' "$PROFILE_FOR_MATRIX"
     printf 'OMNIVOICE_DTYPE=%q\n' "$dtype"
     printf 'OMNIVOICE_ACCELERATION=%q\n' "$acceleration"
@@ -244,17 +251,18 @@ wait_for_health() {
   local expected_batch="$3"
   local expected_dtype="$4"
   local expected_profile="$5"
-  local output_path="$6"
+  local expected_model="$6"
+  local output_path="$7"
   local deadline=$((SECONDS + HEALTH_TIMEOUT_SECONDS))
   local tmp_path="$output_path.tmp"
 
   while (( SECONDS < deadline )); do
     if curl -fsS "$BASE_URL/health" -o "$tmp_path" >/dev/null 2>&1; then
-      if "$PYTHON_BIN" - "$tmp_path" "$expected_acceleration" "$expected_concurrency" "$expected_batch" "$expected_dtype" "$expected_profile" <<'PY'
+      if "$PYTHON_BIN" - "$tmp_path" "$expected_acceleration" "$expected_concurrency" "$expected_batch" "$expected_dtype" "$expected_profile" "$expected_model" <<'PY'
 import json
 import sys
 
-path, expected_acceleration, expected_concurrency, expected_batch, expected_dtype, expected_profile = sys.argv[1:7]
+path, expected_acceleration, expected_concurrency, expected_batch, expected_dtype, expected_profile, expected_model = sys.argv[1:8]
 with open(path, encoding="utf-8") as handle:
     data = json.load(handle)
 
@@ -266,6 +274,7 @@ ok = (
     and str(data.get("batch_size")) == expected_batch
     and data.get("dtype") == expected_dtype
     and data.get("gpu_profile") == expected_profile
+    and data.get("model") == expected_model
 )
 raise SystemExit(0 if ok else 1)
 PY
@@ -286,20 +295,21 @@ PY
 append_case_row() {
   local case_id="$1"
   local profile="$2"
-  local dtype="$3"
-  local acceleration="$4"
-  local concurrency="$5"
-  local step="$6"
-  local speed="$7"
-  local result_json="$8"
-  local status="$9"
+  local model_id="$3"
+  local dtype="$4"
+  local acceleration="$5"
+  local concurrency="$6"
+  local step="$7"
+  local speed="$8"
+  local result_json="$9"
+  local status="${10}"
 
-  "$PYTHON_BIN" - "$case_id" "$profile" "$dtype" "$acceleration" "$concurrency" "$step" "$speed" "$result_json" "$status" <<'PY' >> "$REPORT_MD"
+  "$PYTHON_BIN" - "$case_id" "$profile" "$model_id" "$dtype" "$acceleration" "$concurrency" "$step" "$speed" "$result_json" "$status" <<'PY' >> "$REPORT_MD"
 import json
 import sys
 from pathlib import Path
 
-case_id, profile, dtype, acceleration, concurrency, step, speed, result_json, status = sys.argv[1:10]
+case_id, profile, model_id, dtype, acceleration, concurrency, step, speed, result_json, status = sys.argv[1:11]
 summary = {}
 path = Path(result_json)
 if path.exists():
@@ -312,9 +322,10 @@ def value(name):
     return summary.get(name, "")
 
 print(
-    "| {case} | {profile} | {dtype} | {accel} | {conc} | {batch} | {step} | {speed} | {requests} | {ok} | {failed} | {rps} | {avg} | {p50} | {p90} | {p95} | {p99} | {max_ms} | {hits} | {misses} | {status} |".format(
+    "| {case} | {profile} | {model} | {dtype} | {accel} | {conc} | {batch} | {step} | {speed} | {requests} | {ok} | {failed} | {rps} | {avg} | {p50} | {p90} | {p95} | {p99} | {max_ms} | {hits} | {misses} | {status} |".format(
         case=case_id,
         profile=profile,
+        model=model_id,
         dtype=dtype,
         accel=acceleration,
         conc=concurrency,
@@ -353,6 +364,7 @@ PY
   echo "- Requests per case: $REQUESTS"
   echo "- Detected GPU: ${DETECTED_GPU_NAME:-unknown}"
   echo "- GPU profile: $PROFILE_FOR_MATRIX"
+  echo "- Model matrix: $MATRIX_MODELS"
   echo "- Dtype matrix: $MATRIX_DTYPES"
   echo "- Concurrency matrix: $MATRIX_CONCURRENCIES"
   echo "- Step matrix: $MATRIX_STEPS"
@@ -363,10 +375,11 @@ PY
   echo
   echo "## Results"
   echo
-  echo "| Case | Profile | Dtype | Accel | Concurrency | Batch | Step | Speed | Requests | OK | Failed | RPS | Avg ms | P50 | P90 | P95 | P99 | Max ms | Cache hit | Cache miss | Status |"
-  echo "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
+  echo "| Case | Profile | Model | Dtype | Accel | Concurrency | Batch | Step | Speed | Requests | OK | Failed | RPS | Avg ms | P50 | P90 | P95 | P99 | Max ms | Cache hit | Cache miss | Status |"
+  echo "| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
 } > "$REPORT_MD"
 
+read -r -a MODELS <<< "$MATRIX_MODELS"
 read -r -a ACCELERATIONS <<< "$MATRIX_ACCELERATIONS"
 read -r -a CONCURRENCIES <<< "$MATRIX_CONCURRENCIES"
 read -r -a DTYPES <<< "$MATRIX_DTYPES"
@@ -375,39 +388,41 @@ read -r -a SPEEDS <<< "$MATRIX_SPEEDS"
 
 echo "Writing report to $REPORT_DIR"
 
-for dtype in "${DTYPES[@]}"; do
-  for acceleration in "${ACCELERATIONS[@]}"; do
-    if [[ "$acceleration" == "hybrid" ]]; then
-      echo "Skipping hybrid acceleration"
-      continue
-    fi
-
-    for concurrency in "${CONCURRENCIES[@]}"; do
-      write_case_env "$acceleration" "$concurrency" "$dtype"
-      echo "Restarting API: profile=$PROFILE_FOR_MATRIX dtype=$dtype acceleration=$acceleration concurrency=$concurrency batch=$concurrency"
-      restart_log="$LOG_DIR/restart-${PROFILE_FOR_MATRIX}-${dtype}-${acceleration}-c${concurrency}.log"
-      set +e
-      RESTART=1 APP_DIR="$APP_DIR" VENV_DIR="$VENV_DIR" PORT="$PORT" "$RUN_TMUX" > "$restart_log" 2>&1
-      restart_rc=$?
-      set -e
-
-      if (( restart_rc != 0 )); then
-        echo "Restart failed for profile=$PROFILE_FOR_MATRIX dtype=$dtype acceleration=$acceleration concurrency=$concurrency, see $restart_log"
-        for step in "${STEPS[@]}"; do
-          for speed in "${SPEEDS[@]}"; do
-            speed_id="${speed//./p}"
-            case_id="${PROFILE_FOR_MATRIX}-${dtype}-${acceleration}-c${concurrency}-step${step}-speed${speed_id}"
-            append_case_row "$case_id" "$PROFILE_FOR_MATRIX" "$dtype" "$acceleration" "$concurrency" "$step" "$speed" "$CASE_DIR/$case_id.json" "restart_failed_rc_${restart_rc}"
-            FAILED_CASES=$((FAILED_CASES + 1))
-          done
-        done
+for model_id in "${MODELS[@]}"; do
+  model_slug="$(printf '%s' "$model_id" | tr '/:.' '___')"
+  for dtype in "${DTYPES[@]}"; do
+    for acceleration in "${ACCELERATIONS[@]}"; do
+      if [[ "$acceleration" == "hybrid" ]]; then
+        echo "Skipping hybrid acceleration"
         continue
       fi
 
-      for step in "${STEPS[@]}"; do
-        for speed in "${SPEEDS[@]}"; do
-          speed_id="${speed//./p}"
-          case_id="${PROFILE_FOR_MATRIX}-${dtype}-${acceleration}-c${concurrency}-step${step}-speed${speed_id}"
+      for concurrency in "${CONCURRENCIES[@]}"; do
+        write_case_env "$acceleration" "$concurrency" "$dtype" "$model_id"
+        echo "Restarting API: profile=$PROFILE_FOR_MATRIX model=$model_id dtype=$dtype acceleration=$acceleration concurrency=$concurrency batch=$concurrency"
+        restart_log="$LOG_DIR/restart-${PROFILE_FOR_MATRIX}-${model_slug}-${dtype}-${acceleration}-c${concurrency}.log"
+        set +e
+        RESTART=1 APP_DIR="$APP_DIR" VENV_DIR="$VENV_DIR" PORT="$PORT" "$RUN_TMUX" > "$restart_log" 2>&1
+        restart_rc=$?
+        set -e
+
+        if (( restart_rc != 0 )); then
+          echo "Restart failed for profile=$PROFILE_FOR_MATRIX model=$model_id dtype=$dtype acceleration=$acceleration concurrency=$concurrency, see $restart_log"
+          for step in "${STEPS[@]}"; do
+            for speed in "${SPEEDS[@]}"; do
+              speed_id="${speed//./p}"
+              case_id="${PROFILE_FOR_MATRIX}-${model_slug}-${dtype}-${acceleration}-c${concurrency}-step${step}-speed${speed_id}"
+              append_case_row "$case_id" "$PROFILE_FOR_MATRIX" "$model_id" "$dtype" "$acceleration" "$concurrency" "$step" "$speed" "$CASE_DIR/$case_id.json" "restart_failed_rc_${restart_rc}"
+              FAILED_CASES=$((FAILED_CASES + 1))
+            done
+          done
+          continue
+        fi
+
+        for step in "${STEPS[@]}"; do
+          for speed in "${SPEEDS[@]}"; do
+            speed_id="${speed//./p}"
+            case_id="${PROFILE_FOR_MATRIX}-${model_slug}-${dtype}-${acceleration}-c${concurrency}-step${step}-speed${speed_id}"
           result_json="$CASE_DIR/$case_id.json"
           result_csv="$CASE_DIR/$case_id.csv"
           case_audio_dir="$AUDIO_DIR/$case_id"
@@ -417,11 +432,11 @@ for dtype in "${DTYPES[@]}"; do
           status="ok"
 
           echo "Running $case_id"
-          if ! wait_for_health "$acceleration" "$concurrency" "$concurrency" "$dtype" "$PROFILE_FOR_MATRIX" "$before_health"; then
+          if ! wait_for_health "$acceleration" "$concurrency" "$concurrency" "$dtype" "$PROFILE_FOR_MATRIX" "$model_id" "$before_health"; then
             echo "Health check timed out for $case_id" | tee "$case_log"
             status="health_timeout"
             FAILED_CASES=$((FAILED_CASES + 1))
-            append_case_row "$case_id" "$PROFILE_FOR_MATRIX" "$dtype" "$acceleration" "$concurrency" "$step" "$speed" "$result_json" "$status"
+            append_case_row "$case_id" "$PROFILE_FOR_MATRIX" "$model_id" "$dtype" "$acceleration" "$concurrency" "$step" "$speed" "$result_json" "$status"
             continue
           fi
 
@@ -466,7 +481,8 @@ for dtype in "${DTYPES[@]}"; do
           fi
 
           curl -fsS "$BASE_URL/health" -o "$after_health" >/dev/null 2>&1 || true
-          append_case_row "$case_id" "$PROFILE_FOR_MATRIX" "$dtype" "$acceleration" "$concurrency" "$step" "$speed" "$result_json" "$status"
+          append_case_row "$case_id" "$PROFILE_FOR_MATRIX" "$model_id" "$dtype" "$acceleration" "$concurrency" "$step" "$speed" "$result_json" "$status"
+          done
         done
       done
     done
