@@ -52,6 +52,7 @@ GPU_PROFILE = os.getenv("OMNIVOICE_GPU_PROFILE", "auto").lower().strip()
 MODEL_DTYPE = os.getenv("OMNIVOICE_DTYPE", "fp16").lower().strip()
 ACCELERATION = os.getenv("OMNIVOICE_ACCELERATION", "base").lower().strip()
 CHUNK_SIZE_CHARS = max(1, int(os.getenv("OMNIVOICE_CHUNK_SIZE_CHARS", "200")))
+BRACKET_AUDIO_TAG_MAX_CHARS = 30
 BATCH_SIZE = max(1, int(os.getenv("OMNIVOICE_BATCH_SIZE", "12")))
 BATCH_MAX_WAIT_MS = max(0.0, float(os.getenv("OMNIVOICE_BATCH_MAX_WAIT_MS", "100")))
 BUSY_BACKLOG_CHUNKS = max(1, int(os.getenv("OMNIVOICE_BUSY_BACKLOG_CHUNKS", str(BATCH_SIZE * 2))))
@@ -195,21 +196,61 @@ def _write_transcript(ref_audio_url: str, transcript: str) -> None:
     tmp_path.replace(path)
 
 
+def _protected_bracket_spans(text: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    for match in re.finditer(r"\[([^\[\]\n]*)\]", text):
+        if len(match.group(1)) <= BRACKET_AUDIO_TAG_MAX_CHARS:
+            spans.append(match.span())
+    return spans
+
+
+def _is_inside_span(index: int, spans: list[tuple[int, int]]) -> bool:
+    return any(start < index < end for start, end in spans)
+
+
+def _adjust_cut_around_protected_span(text: str, cut: int) -> int:
+    for start, end in _protected_bracket_spans(text):
+        if start < cut < end:
+            if start > 0:
+                return start
+            return end
+    return cut
+
+
+def _split_sentence_parts(text: str) -> list[str]:
+    protected_spans = _protected_bracket_spans(text)
+    parts: list[str] = []
+    start = 0
+
+    for match in re.finditer(r"(?<=[.!?。！？])\s+", text):
+        if _is_inside_span(match.start(), protected_spans):
+            continue
+        parts.append(text[start : match.start()].strip())
+        start = match.end()
+
+    parts.append(text[start:].strip())
+    return [part for part in parts if part]
+
+
 def _split_long_text_segment(segment: str, target_chars: int) -> list[str]:
     chunks: list[str] = []
     remaining = segment.strip()
     soft_separators = [",", ";", ":", "，", "；", "：", " "]
 
     while len(remaining) > target_chars:
+        protected_spans = _protected_bracket_spans(remaining)
         cut = -1
         for separator in soft_separators:
             candidate = remaining.rfind(separator, 0, target_chars + 1)
+            if candidate >= 0 and _is_inside_span(candidate, protected_spans):
+                continue
             if candidate > cut:
                 cut = candidate + (0 if separator == " " else 1)
 
         if cut < max(1, target_chars // 2):
             cut = target_chars
 
+        cut = _adjust_cut_around_protected_span(remaining, cut)
         chunk = remaining[:cut].strip()
         if chunk:
             chunks.append(chunk)
@@ -225,7 +266,7 @@ def _split_text_chunks(text: str) -> list[str]:
     if not normalized:
         return []
 
-    sentence_parts = re.split(r"(?<=[.!?。！？])\s+", normalized)
+    sentence_parts = _split_sentence_parts(normalized)
     chunks: list[str] = []
     current = ""
 
