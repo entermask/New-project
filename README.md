@@ -13,13 +13,35 @@ Returns model, GPU, concurrency, and cache status.
   "status": "ok",
   "model_loaded": true,
   "gpu": "NVIDIA A100 80GB",
+  "gpu_profile": "a100",
+  "requested_gpu_profile": "auto",
+  "dtype": "fp16",
   "cache_audio_count": 12,
   "cache_transcript_count": 12,
   "active_requests": 3,
   "active_generations": 1,
+  "active_generation_batches": 1,
   "queued_generations": 2,
   "max_concurrency": 4,
+  "generation_capacity": 4,
   "available_generation_slots": 3,
+  "batching_enabled": true,
+  "batch_size": 4,
+  "batch_max_wait_ms": 100.0,
+  "batch_queue_size": 256,
+  "voice_clone_prompt_cache_enabled": true,
+  "voice_clone_prompt_cache_size": 8,
+  "voice_clone_prompt_cache_max_size": 64,
+  "voice_clone_prompt_cache_ttl_seconds": 3600,
+  "voice_clone_prompt_cache_hits": 120,
+  "voice_clone_prompt_cache_misses": 8,
+  "voice_clone_prompt_cache_evictions": 0,
+  "tts_jobs": {
+    "queued": 2,
+    "running": 1,
+    "succeeded": 20,
+    "failed": 0
+  },
   "acceleration": "base"
 }
 ```
@@ -61,7 +83,43 @@ format=wav
 
 Supported formats: `wav`, `mp3`.
 
-Response body is binary audio. Headers:
+Response:
+
+```json
+{
+  "request_id": "f5a4e...",
+  "status": "queued",
+  "created_at": 1778730000.0,
+  "updated_at": 1778730000.0,
+  "status_url": "/v1/tts/jobs/f5a4e..."
+}
+```
+
+Poll the job:
+
+```http
+GET /v1/tts/jobs/<request_id>
+```
+
+When the job succeeds, the status response includes:
+
+```json
+{
+  "status": "succeeded",
+  "audio_url": "/v1/tts/jobs/<request_id>/audio",
+  "format": "mp3",
+  "cache_hit": true,
+  "transcript": "Reference transcript"
+}
+```
+
+Download the audio:
+
+```http
+GET /v1/tts/jobs/<request_id>/audio
+```
+
+Audio response headers:
 
 ```http
 Content-Type: audio/wav or audio/mpeg
@@ -69,6 +127,22 @@ X-Request-Id: <uuid>
 X-Cache-Hit: true|false
 X-Transcript: <url-encoded-transcript>
 X-Transcript-Encoding: urlencoded-utf8
+```
+
+For direct audio responses during benchmarking, use `POST /v1/tts/sync`.
+
+Completed job metadata and audio files are kept for `OMNIVOICE_JOB_TTL_SECONDS`, default `3600`.
+
+Example:
+
+```bash
+JOB_JSON=$(curl -sS -X POST "$BASE_URL/v1/tts" \
+  -H "Authorization: Bearer $API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"text":"Xin chao","ref_audio_url":"https://example.com/ref.wav","format":"mp3","num_step":16}')
+
+STATUS_URL=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["status_url"])' <<< "$JOB_JSON")
+curl -sS -H "Authorization: Bearer $API_TOKEN" "$BASE_URL$STATUS_URL"
 ```
 
 ## Cache
@@ -85,16 +159,76 @@ tmp/
 
 If `ref_text` is provided, it is used and written to transcript cache. If `ref_text` is missing, the server reuses a cached transcript when present. Otherwise, OmniVoice auto-transcribes the reference audio with Whisper during prompt creation and the resolved transcript is cached afterward.
 
+The service also keeps an in-memory LRU cache of OmniVoice `voice_clone_prompt` objects. This does not change the request payload: clients still send `ref_audio_url` and optional `ref_text`. The cache key is based on model, acceleration mode, cached reference audio path, and resolved reference transcript.
+
+```text
+OMNIVOICE_ENABLE_PROMPT_CACHE=1
+OMNIVOICE_PROMPT_CACHE_SIZE=64
+OMNIVOICE_PROMPT_CACHE_TTL_SECONDS=3600
+```
+
+This cache is per process. If multiple instances are running, each instance warms its own prompt cache unless traffic is routed consistently to the same instance.
+
+## Micro-Batching
+
+`/v1/tts` uses a small server-side generation queue by default. Requests still get individual audio responses, but the GPU generation step is grouped into short batches before calling OmniVoice.
+
+```text
+OMNIVOICE_ENABLE_BATCHING=1
+OMNIVOICE_BATCH_SIZE=4
+OMNIVOICE_BATCH_MAX_WAIT_MS=100
+OMNIVOICE_BATCH_QUEUE_SIZE=256
+OMNIVOICE_MAX_INFLIGHT_JOBS=20
+OMNIVOICE_JOB_TTL_SECONDS=3600
+```
+
+`OMNIVOICE_BATCH_SIZE` defaults to `OMNIVOICE_CONCURRENCY`. Start with `4` or `6` on A100, then test `8` and `12`. On H100, start at `8` or `12`, then test `16`, `24`, and `32`. Increase `OMNIVOICE_BATCH_MAX_WAIT_MS` only if traffic is sparse and batches are not filling; lower it if first-token latency matters more than throughput.
+
+Batching groups compatible requests by `num_step`, `speed`, and `language`.
+
+`OMNIVOICE_MAX_INFLIGHT_JOBS` limits async `/v1/tts` queued/running jobs. When the limit is reached, new submissions return `429 Too Many Requests` with `Retry-After: 1`.
+
 ## Acceleration
+
+Set the GPU profile and model dtype:
+
+```text
+OMNIVOICE_GPU_PROFILE=auto
+OMNIVOICE_DTYPE=fp16
+```
+
+Supported profiles are `auto`, `a100`, `h100`, and `generic`. Supported dtypes are `fp16` and `bf16`. A100 and H100 both support BF16, so benchmark both `fp16` and `bf16`; the faster path depends on the OmniVoice and `omnivoice-triton` backend path.
+
+The official checkpoint remains the default:
+
+```text
+OMNIVOICE_MODEL=k2-fsa/OmniVoice
+```
+
+You can also benchmark the BF16-converted checkpoint as a drop-in model option:
+
+```text
+OMNIVOICE_MODEL=drbaph/OmniVoice-bf16
+OMNIVOICE_DTYPE=bf16
+```
 
 Set `OMNIVOICE_ACCELERATION`:
 
 ```text
 base
+triton
 hybrid
 ```
 
-`base` is the official OmniVoice path and is the default. `hybrid` uses `omnivoice-triton` CUDA Graph + Triton kernel optimization for experimental benchmarking. Because CUDA Graph uses captured static buffers, test concurrency carefully before using `hybrid` for live traffic.
+`base` is the official OmniVoice path and is the default. `triton` uses `omnivoice-triton` kernel fusion without CUDA Graph capture, so it is the safer optimized mode to test with batching/concurrency. `hybrid` uses CUDA Graph + Triton and should stay experimental because concurrent graph capture can fail; start `hybrid` with concurrency `1`.
+
+Recommended testing order:
+
+```text
+base   -> stable baseline
+triton -> safer optimization test
+hybrid -> single-flight experiment only
+```
 
 ## Thunder Setup
 
@@ -116,6 +250,54 @@ Clone this repo on Thunder:
 git clone git@github.com:<your-org-or-user>/omnivoice-api.git
 cd omnivoice-api
 ./scripts/install_thunder.sh
+```
+
+This installs Python deps into `~/venvs/omnivoice-api`, ensures Python `3.12+`, installs system packages, and installs NVIDIA drivers if `nvidia-smi` is not working.
+
+```text
+ffmpeg
+tmux
+curl
+ca-certificates
+lsb-release
+build-essential
+gcc
+g++
+ufw
+NVIDIA driver packages when needed
+```
+
+Install options:
+
+```bash
+# Skip NVIDIA driver install/check
+INSTALL_NVIDIA_DRIVER=0 ./scripts/install_thunder.sh
+
+# Force a specific Ubuntu NVIDIA driver package, e.g. nvidia-driver-550
+NVIDIA_DRIVER_VERSION=550 ./scripts/install_thunder.sh
+
+# Use an existing Python >=3.12 binary
+PYTHON_BIN=/usr/bin/python3.12 ./scripts/install_thunder.sh
+
+# Disable deadsnakes fallback if Python 3.12 is missing from apt
+ALLOW_DEADSNAKES_PPA=0 ./scripts/install_thunder.sh
+
+# Add UFW allow rules and enable firewall non-interactively
+ENABLE_UFW=1 ./scripts/install_thunder.sh
+
+# Custom app/SSH ports for UFW rules
+APP_PORT=8001 SSH_PORT=22 ./scripts/install_thunder.sh
+```
+
+If the script installs an NVIDIA driver, restart/reboot the instance before expecting `nvidia-smi` to work.
+
+The install script adds UFW allow rules for SSH and the app port. By default it does not enable UFW. To enable manually:
+
+```bash
+sudo ufw allow ssh
+sudo ufw allow 8001/tcp
+sudo ufw enable
+sudo ufw status verbose
 ```
 
 Configure env:
@@ -141,7 +323,95 @@ Expose through Thunder:
 tnr ports forward 0 --add 8001
 ```
 
-## systemd
+## Run With tmux
+
+Some Thunder environments do not boot with `systemd` as PID 1. Use `tmux` so the API keeps running after you close SSH/CLI.
+
+Quick start:
+
+```bash
+cd ~/New-project
+./scripts/run_tmux.sh
+```
+
+Restart the existing tmux service:
+
+```bash
+cd ~/New-project
+RESTART=1 ./scripts/run_tmux.sh
+```
+
+Use a different port:
+
+```bash
+cd ~/New-project
+PORT=8081 ./scripts/run_tmux.sh
+```
+
+Install tmux:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y tmux
+```
+
+Start the API:
+
+```bash
+tmux new -s omnivoice
+```
+
+Inside tmux:
+
+```bash
+cd ~/New-project
+source ~/venvs/omnivoice-api/bin/activate
+set -a
+source .env
+set +a
+uvicorn app:app --host 0.0.0.0 --port 8001
+```
+
+Detach while leaving the API running:
+
+```text
+Ctrl+B
+D
+```
+
+Reattach:
+
+```bash
+tmux attach -t omnivoice
+```
+
+List sessions:
+
+```bash
+tmux ls
+```
+
+Stop the API:
+
+```bash
+tmux attach -t omnivoice
+# then press Ctrl+C
+exit
+```
+
+Expose the port:
+
+```bash
+tnr ports forward 0 --add 8001
+```
+
+Health check:
+
+```bash
+curl http://127.0.0.1:8001/health
+```
+
+## systemd Optional
 
 Install the unit after editing `WorkingDirectory`, `EnvironmentFile`, and `ExecStart` if your paths differ:
 
@@ -181,21 +451,86 @@ python scripts/benchmark_tts.py \
   --base-url "https://<instance-uuid>-8001.thundercompute.net" \
   --token "change-me" \
   --ref-audio-url "https://example.com/ref.wav" \
+  --ref-audio-variants 1 \
   --text "Xin chao, day la benchmark OmniVoice." \
   --language vi \
   --requests 20 \
   --concurrency 4 \
   --speed 1.1 \
   --format mp3 \
+  --mode poll \
   --results-json benchmark.json \
   --results-csv benchmark.csv
 ```
 
+To benchmark cold/warm behavior across many reference-audio cache keys while downloading the same source object, create query-string variants:
+
+```bash
+python scripts/benchmark_tts.py \
+  --base-url "$BASE_URL" \
+  --token "$API_TOKEN" \
+  --ref-audio-url "https://example.com/ref.mp3" \
+  --ref-audio-variants 8 \
+  --ref-audio-variant-param a \
+  --ref-audio-selection round-robin \
+  --requests 40 \
+  --concurrency 8 \
+  --format mp3 \
+  --mode poll
+```
+
+This sends `ref.mp3?a=1`, `ref.mp3?a=2`, ... `ref.mp3?a=8`. Use `--ref-audio-selection grouped` if you want each variant to receive a contiguous block of requests instead of round-robin traffic.
+
+Benchmark results include audio duration and RTF (`elapsed_ms / audio_duration_ms`) when `ffprobe` is available. Install `ffmpeg` on the benchmark client for MP3 duration probing.
+
 Compare WAV and MP3 with the same payload:
 
 ```bash
-python scripts/benchmark_tts.py --base-url "$BASE_URL" --token "$API_TOKEN" --ref-audio-url "$REF_AUDIO_URL" --requests 20 --concurrency 4 --format wav
-python scripts/benchmark_tts.py --base-url "$BASE_URL" --token "$API_TOKEN" --ref-audio-url "$REF_AUDIO_URL" --requests 20 --concurrency 4 --format mp3
+python scripts/benchmark_tts.py --base-url "$BASE_URL" --token "$API_TOKEN" --ref-audio-url "$REF_AUDIO_URL" --requests 20 --concurrency 4 --format wav --mode poll
+python scripts/benchmark_tts.py --base-url "$BASE_URL" --token "$API_TOKEN" --ref-audio-url "$REF_AUDIO_URL" --requests 20 --concurrency 4 --format mp3 --mode poll
 ```
 
-For hybrid acceleration, start with `OMNIVOICE_CONCURRENCY=1`, then benchmark `--concurrency 1`, `2`, and `4`.
+The server-side matrix defaults to `base` acceleration. Set `MATRIX_ACCELERATIONS="base triton"` only when you explicitly want to compare Triton. For `hybrid`, start with `OMNIVOICE_CONCURRENCY=1` and benchmark `--concurrency 1`; only increase it if CUDA Graph capture stays stable.
+
+Run the server-side matrix benchmark when comparing A100 and H100:
+
+```bash
+# Auto-detects A100/H100 from nvidia-smi and chooses the matching matrix.
+./scripts/run_server_benchmark_report.sh
+
+# Run one-ref, eight-ref, and one-ref-per-request cases derived from one .mp3.
+MATRIX_REF_AUDIO_VARIANTS="1 8 requests" REF_AUDIO_VARIANT_PARAM=a ./scripts/run_server_benchmark_report.sh
+
+# Force the A100 matrix.
+GPU_PROFILE=a100 ./scripts/run_server_benchmark_report.sh
+
+# Force the H100 matrix: larger batch/concurrency and fp16+bf16 dtype tests.
+GPU_PROFILE=h100 ./scripts/run_server_benchmark_report.sh
+
+# Compare official and BF16-converted checkpoints.
+MATRIX_MODELS="k2-fsa/OmniVoice drbaph/OmniVoice-bf16" MATRIX_DTYPES="bf16" ./scripts/run_server_benchmark_report.sh
+```
+
+H100 defaults are:
+
+```text
+MATRIX_CONCURRENCIES="8 12 16 24 32"
+MATRIX_DTYPES="fp16 bf16"
+MATRIX_STEPS="16 32"
+OMNIVOICE_BATCH_MAX_WAIT_MS=50
+```
+
+For a quick H100 smoke test:
+
+```bash
+REQUESTS=2 GPU_PROFILE=h100 MATRIX_ACCELERATIONS=base MATRIX_CONCURRENCIES=16 MATRIX_DTYPES=fp16 MATRIX_SPEEDS=1.1 ./scripts/run_server_benchmark_report.sh
+```
+
+A100 defaults are:
+
+```text
+MATRIX_CONCURRENCIES="4 6 8 12"
+MATRIX_DTYPES="fp16 bf16"
+MATRIX_STEPS="16 32"
+OMNIVOICE_BATCH_MAX_WAIT_MS=100
+```

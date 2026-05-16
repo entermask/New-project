@@ -11,7 +11,6 @@ Required unless present in .env:
 Common overrides:
   BASE_URL                     Default: http://127.0.0.1:8001
   REF_AUDIO_URL                Default: German sample URL from Hailuo CDN
-  REF_AUDIO_VARIANTS           Default: 1. If >1, benchmark adds ?a=1, ?a=2, ...
   REF_AUDIO_VARIANT_PARAM      Default: a
   REF_AUDIO_SELECTION          Default: round-robin. Options: round-robin, grouped
   REF_TEXT                     Optional reference transcript
@@ -28,11 +27,12 @@ Common overrides:
 
 Matrix overrides, space-separated:
   MATRIX_MODELS                Default: k2-fsa/OmniVoice
-  MATRIX_ACCELERATIONS         Default: base triton
+  MATRIX_ACCELERATIONS         Default: base
   MATRIX_CONCURRENCIES         A100 default: 4 6 8 12; H100 default: 8 12 16 24 32
   MATRIX_DTYPES                A100/H100 default: fp16 bf16
   MATRIX_STEPS                 Default: 16 32
   MATRIX_SPEEDS                Default: 1.0 1.1
+  MATRIX_REF_AUDIO_VARIANTS    Default: 1 4 requests. Use "requests" for one ref URL variant per request.
 
 Example smoke test:
   REQUESTS=2 GPU_PROFILE=h100 MATRIX_CONCURRENCIES=16 MATRIX_DTYPES=fp16 MATRIX_SPEEDS=1.1 MATRIX_ACCELERATIONS=base ./scripts/run_server_benchmark_report.sh
@@ -55,7 +55,6 @@ VENV_DIR="${VENV_DIR:-$HOME/venvs/omnivoice-api}"
 PORT="${PORT:-8001}"
 BASE_URL="${BASE_URL:-http://127.0.0.1:$PORT}"
 REF_AUDIO_URL="${REF_AUDIO_URL:-https://cdn.hailuoai.video/moss/prod/2026-05-14-05/moss-audio/voice/u_2054676293873570458/demo/1778708587932629888-397944920203503_German.mp3}"
-REF_AUDIO_VARIANTS="${REF_AUDIO_VARIANTS:-1}"
 REF_AUDIO_VARIANT_PARAM="${REF_AUDIO_VARIANT_PARAM:-a}"
 REF_AUDIO_SELECTION="${REF_AUDIO_SELECTION:-round-robin}"
 REF_TEXT="${REF_TEXT:-}"
@@ -110,12 +109,13 @@ case "$PROFILE_FOR_MATRIX" in
     ;;
 esac
 
-if [[ -z "${MATRIX_ACCELERATIONS+x}" ]]; then MATRIX_ACCELERATIONS="base triton"; fi
+if [[ -z "${MATRIX_ACCELERATIONS+x}" ]]; then MATRIX_ACCELERATIONS="base"; fi
 if [[ -z "${MATRIX_MODELS+x}" ]]; then MATRIX_MODELS="k2-fsa/OmniVoice"; fi
 if [[ -z "${MATRIX_CONCURRENCIES+x}" ]]; then MATRIX_CONCURRENCIES="$DEFAULT_CONCURRENCIES"; fi
 if [[ -z "${MATRIX_DTYPES+x}" ]]; then MATRIX_DTYPES="$DEFAULT_DTYPES"; fi
 if [[ -z "${MATRIX_STEPS+x}" ]]; then MATRIX_STEPS="16 32"; fi
 if [[ -z "${MATRIX_SPEEDS+x}" ]]; then MATRIX_SPEEDS="1.0 1.1"; fi
+if [[ -z "${MATRIX_REF_AUDIO_VARIANTS+x}" ]]; then MATRIX_REF_AUDIO_VARIANTS="1 4 requests"; fi
 
 ENV_FILE="$APP_DIR/.env"
 RUN_TMUX="$APP_DIR/scripts/run_tmux.sh"
@@ -311,17 +311,18 @@ append_case_row() {
   local dtype="$4"
   local acceleration="$5"
   local concurrency="$6"
-  local step="$7"
-  local speed="$8"
-  local result_json="$9"
-  local status="${10}"
+  local ref_variants="$7"
+  local step="$8"
+  local speed="$9"
+  local result_json="${10}"
+  local status="${11}"
 
-  "$PYTHON_BIN" - "$case_id" "$profile" "$model_id" "$dtype" "$acceleration" "$concurrency" "$step" "$speed" "$result_json" "$status" <<'PY' >> "$REPORT_MD"
+  "$PYTHON_BIN" - "$case_id" "$profile" "$model_id" "$dtype" "$acceleration" "$concurrency" "$ref_variants" "$step" "$speed" "$result_json" "$status" <<'PY' >> "$REPORT_MD"
 import json
 import sys
 from pathlib import Path
 
-case_id, profile, model_id, dtype, acceleration, concurrency, step, speed, result_json, status = sys.argv[1:11]
+case_id, profile, model_id, dtype, acceleration, concurrency, ref_variants, step, speed, result_json, status = sys.argv[1:12]
 summary = {}
 path = Path(result_json)
 if path.exists():
@@ -334,7 +335,7 @@ def value(name):
     return summary.get(name, "")
 
 print(
-    "| {case} | {profile} | {model} | {dtype} | {accel} | {conc} | {batch} | {step} | {speed} | {requests} | {ok} | {failed} | {rps} | {avg} | {p50} | {p90} | {p95} | {p99} | {max_ms} | {hits} | {misses} | {status} |".format(
+    "| {case} | {profile} | {model} | {dtype} | {accel} | {conc} | {batch} | {refs} | {step} | {speed} | {requests} | {ok} | {failed} | {rps} | {avg} | {p50} | {p90} | {p95} | {p99} | {max_ms} | {audio_s} | {avg_rtf} | {p95_rtf} | {hits} | {misses} | {status} |".format(
         case=case_id,
         profile=profile,
         model=model_id,
@@ -342,6 +343,7 @@ print(
         accel=acceleration,
         conc=concurrency,
         batch=concurrency,
+        refs=ref_variants,
         step=step,
         speed=speed,
         requests=value("requests"),
@@ -354,6 +356,9 @@ print(
         p95=value("p95_ms"),
         p99=value("p99_ms"),
         max_ms=value("max_ms"),
+        audio_s=value("audio_duration_s"),
+        avg_rtf=value("avg_rtf"),
+        p95_rtf=value("p95_rtf"),
         hits=value("cache_hits"),
         misses=value("cache_misses"),
         status=status,
@@ -389,6 +394,8 @@ payload = {
         "total_elapsed_s": 0,
         "requests_per_s": 0,
         "bytes_downloaded": 0,
+        "audio_duration_ms": 0,
+        "audio_duration_s": 0,
         "avg_ms": 0,
         "min_ms": 0,
         "p50_ms": 0,
@@ -396,6 +403,13 @@ payload = {
         "p95_ms": 0,
         "p99_ms": 0,
         "max_ms": 0,
+        "avg_rtf": 0,
+        "min_rtf": 0,
+        "p50_rtf": 0,
+        "p90_rtf": 0,
+        "p95_rtf": 0,
+        "p99_rtf": 0,
+        "max_rtf": 0,
         "cache_hits": 0,
         "cache_misses": 0,
     },
@@ -410,13 +424,32 @@ Path(result_json).write_text(json.dumps(payload, indent=2, ensure_ascii=False), 
 PY
 }
 
+resolve_ref_variants() {
+  local value="$1"
+  case "$value" in
+    requests|request|all|unique)
+      printf '%s\n' "$REQUESTS"
+      ;;
+    ''|*[!0-9]*)
+      echo "MATRIX_REF_AUDIO_VARIANTS values must be positive integers or 'requests': $value" >&2
+      return 1
+      ;;
+    0)
+      echo "MATRIX_REF_AUDIO_VARIANTS values must be >= 1: $value" >&2
+      return 1
+      ;;
+    *)
+      printf '%s\n' "$value"
+      ;;
+  esac
+}
+
 {
   echo "# OmniVoice TTS Benchmark Report"
   echo
   echo "- Started: $(date -Iseconds)"
   echo "- Base URL: $BASE_URL"
   echo "- Reference audio: $REF_AUDIO_URL"
-  echo "- Reference audio variants: $REF_AUDIO_VARIANTS"
   echo "- Reference audio variant param: $REF_AUDIO_VARIANT_PARAM"
   echo "- Reference audio selection: $REF_AUDIO_SELECTION"
   echo "- Text: $TEXT"
@@ -427,6 +460,7 @@ PY
   echo "- Model matrix: $MATRIX_MODELS"
   echo "- Dtype matrix: $MATRIX_DTYPES"
   echo "- Concurrency matrix: $MATRIX_CONCURRENCIES"
+  echo "- Reference audio variant matrix: $MATRIX_REF_AUDIO_VARIANTS"
   echo "- Step matrix: $MATRIX_STEPS"
   echo "- Batch max wait ms: ${OMNIVOICE_BATCH_MAX_WAIT_MS:-$DEFAULT_BATCH_MAX_WAIT_MS}"
   echo "- Format: $FORMAT"
@@ -435,8 +469,8 @@ PY
   echo
   echo "## Results"
   echo
-  echo "| Case | Profile | Model | Dtype | Accel | Concurrency | Batch | Step | Speed | Requests | OK | Failed | RPS | Avg ms | P50 | P90 | P95 | P99 | Max ms | Cache hit | Cache miss | Status |"
-  echo "| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
+  echo "| Case | Profile | Model | Dtype | Accel | Concurrency | Batch | Ref variants | Step | Speed | Requests | OK | Failed | RPS | Avg ms | P50 | P90 | P95 | P99 | Max ms | Audio s | Avg RTF | P95 RTF | Cache hit | Cache miss | Status |"
+  echo "| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
 } > "$REPORT_MD"
 
 read -r -a MODELS <<< "$MATRIX_MODELS"
@@ -445,6 +479,7 @@ read -r -a CONCURRENCIES <<< "$MATRIX_CONCURRENCIES"
 read -r -a DTYPES <<< "$MATRIX_DTYPES"
 read -r -a STEPS <<< "$MATRIX_STEPS"
 read -r -a SPEEDS <<< "$MATRIX_SPEEDS"
+read -r -a REF_VARIANTS <<< "$MATRIX_REF_AUDIO_VARIANTS"
 
 echo "Writing report to $REPORT_DIR"
 
@@ -468,81 +503,87 @@ for model_id in "${MODELS[@]}"; do
 
         if (( restart_rc != 0 )); then
           echo "Restart failed for profile=$PROFILE_FOR_MATRIX model=$model_id dtype=$dtype acceleration=$acceleration concurrency=$concurrency, see $restart_log"
-          for step in "${STEPS[@]}"; do
-            for speed in "${SPEEDS[@]}"; do
-              speed_id="${speed//./p}"
-              case_id="${PROFILE_FOR_MATRIX}-${model_slug}-${dtype}-${acceleration}-c${concurrency}-step${step}-speed${speed_id}"
-              append_case_row "$case_id" "$PROFILE_FOR_MATRIX" "$model_id" "$dtype" "$acceleration" "$concurrency" "$step" "$speed" "$CASE_DIR/$case_id.json" "restart_failed_rc_${restart_rc}"
-              FAILED_CASES=$((FAILED_CASES + 1))
+          for ref_variants in "${REF_VARIANTS[@]}"; do
+            resolved_ref_variants="$(resolve_ref_variants "$ref_variants")"
+            for step in "${STEPS[@]}"; do
+              for speed in "${SPEEDS[@]}"; do
+                speed_id="${speed//./p}"
+                case_id="${PROFILE_FOR_MATRIX}-${model_slug}-${dtype}-${acceleration}-c${concurrency}-refs${ref_variants}-step${step}-speed${speed_id}"
+                append_case_row "$case_id" "$PROFILE_FOR_MATRIX" "$model_id" "$dtype" "$acceleration" "$concurrency" "$resolved_ref_variants" "$step" "$speed" "$CASE_DIR/$case_id.json" "restart_failed_rc_${restart_rc}"
+                FAILED_CASES=$((FAILED_CASES + 1))
+              done
             done
           done
           continue
         fi
 
-        for step in "${STEPS[@]}"; do
-          for speed in "${SPEEDS[@]}"; do
-            speed_id="${speed//./p}"
-            case_id="${PROFILE_FOR_MATRIX}-${model_slug}-${dtype}-${acceleration}-c${concurrency}-step${step}-speed${speed_id}"
-          result_json="$CASE_DIR/$case_id.json"
-          result_csv="$CASE_DIR/$case_id.csv"
-          case_audio_dir="$AUDIO_DIR/$case_id"
-          before_health="$HEALTH_DIR/$case_id-before.json"
-          after_health="$HEALTH_DIR/$case_id-after.json"
-          case_log="$LOG_DIR/$case_id.log"
-          status="ok"
+        for ref_variants in "${REF_VARIANTS[@]}"; do
+          resolved_ref_variants="$(resolve_ref_variants "$ref_variants")"
+          for step in "${STEPS[@]}"; do
+            for speed in "${SPEEDS[@]}"; do
+              speed_id="${speed//./p}"
+              case_id="${PROFILE_FOR_MATRIX}-${model_slug}-${dtype}-${acceleration}-c${concurrency}-refs${ref_variants}-step${step}-speed${speed_id}"
+              result_json="$CASE_DIR/$case_id.json"
+              result_csv="$CASE_DIR/$case_id.csv"
+              case_audio_dir="$AUDIO_DIR/$case_id"
+              before_health="$HEALTH_DIR/$case_id-before.json"
+              after_health="$HEALTH_DIR/$case_id-after.json"
+              case_log="$LOG_DIR/$case_id.log"
+              status="ok"
 
-          echo "Running $case_id"
-          if ! wait_for_health "$acceleration" "$concurrency" "$concurrency" "$dtype" "$PROFILE_FOR_MATRIX" "$model_id" "$before_health"; then
-            echo "Health check timed out for $case_id" | tee "$case_log"
-            status="health_timeout"
-            FAILED_CASES=$((FAILED_CASES + 1))
-            append_case_row "$case_id" "$PROFILE_FOR_MATRIX" "$model_id" "$dtype" "$acceleration" "$concurrency" "$step" "$speed" "$result_json" "$status"
-            continue
-          fi
+              echo "Running $case_id"
+              if ! wait_for_health "$acceleration" "$concurrency" "$concurrency" "$dtype" "$PROFILE_FOR_MATRIX" "$model_id" "$before_health"; then
+                echo "Health check timed out for $case_id" | tee "$case_log"
+                status="health_timeout"
+                FAILED_CASES=$((FAILED_CASES + 1))
+                append_case_row "$case_id" "$PROFILE_FOR_MATRIX" "$model_id" "$dtype" "$acceleration" "$concurrency" "$resolved_ref_variants" "$step" "$speed" "$result_json" "$status"
+                continue
+              fi
 
-          mkdir -p "$case_audio_dir"
-          benchmark_args=(
-            "$PYTHON_BIN" "$BENCHMARK"
-            --base-url "$BASE_URL"
-            --token "$API_TOKEN"
-            --ref-audio-url "$REF_AUDIO_URL"
-            --ref-audio-variants "$REF_AUDIO_VARIANTS"
-            --ref-audio-variant-param "$REF_AUDIO_VARIANT_PARAM"
-            --ref-audio-selection "$REF_AUDIO_SELECTION"
-            --text "$TEXT"
-            --requests "$REQUESTS"
-            --concurrency "$concurrency"
-            --num-step "$step"
-            --speed "$speed"
-            --format "$FORMAT"
-            --mode "$MODE"
-            --poll-interval "$POLL_INTERVAL"
-            --timeout "$REQUEST_TIMEOUT"
-            --output-dir "$case_audio_dir"
-            --results-json "$result_json"
-            --results-csv "$result_csv"
-            --fail-on-error
-          )
+              mkdir -p "$case_audio_dir"
+              benchmark_args=(
+                "$PYTHON_BIN" "$BENCHMARK"
+                --base-url "$BASE_URL"
+                --token "$API_TOKEN"
+                --ref-audio-url "$REF_AUDIO_URL"
+                --ref-audio-variants "$resolved_ref_variants"
+                --ref-audio-variant-param "$REF_AUDIO_VARIANT_PARAM"
+                --ref-audio-selection "$REF_AUDIO_SELECTION"
+                --text "$TEXT"
+                --requests "$REQUESTS"
+                --concurrency "$concurrency"
+                --num-step "$step"
+                --speed "$speed"
+                --format "$FORMAT"
+                --mode "$MODE"
+                --poll-interval "$POLL_INTERVAL"
+                --timeout "$REQUEST_TIMEOUT"
+                --output-dir "$case_audio_dir"
+                --results-json "$result_json"
+                --results-csv "$result_csv"
+                --fail-on-error
+              )
 
-          if [[ -n "$LANGUAGE" ]]; then
-            benchmark_args+=(--language "$LANGUAGE")
-          fi
-          if [[ -n "$REF_TEXT" ]]; then
-            benchmark_args+=(--ref-text "$REF_TEXT")
-          fi
+              if [[ -n "$LANGUAGE" ]]; then
+                benchmark_args+=(--language "$LANGUAGE")
+              fi
+              if [[ -n "$REF_TEXT" ]]; then
+                benchmark_args+=(--ref-text "$REF_TEXT")
+              fi
 
-          set +e
-          "${benchmark_args[@]}" > "$case_log" 2>&1
-          rc=$?
-          set -e
-          if (( rc != 0 )); then
-            status="benchmark_failed_rc_${rc}"
-            FAILED_CASES=$((FAILED_CASES + 1))
-            write_failed_result_json "$result_json" "$case_log" "$rc"
-          fi
+              set +e
+              "${benchmark_args[@]}" > "$case_log" 2>&1
+              rc=$?
+              set -e
+              if (( rc != 0 )); then
+                status="benchmark_failed_rc_${rc}"
+                FAILED_CASES=$((FAILED_CASES + 1))
+                write_failed_result_json "$result_json" "$case_log" "$rc"
+              fi
 
-          curl -fsS "$BASE_URL/health" -o "$after_health" >/dev/null 2>&1 || true
-          append_case_row "$case_id" "$PROFILE_FOR_MATRIX" "$model_id" "$dtype" "$acceleration" "$concurrency" "$step" "$speed" "$result_json" "$status"
+              curl -fsS "$BASE_URL/health" -o "$after_health" >/dev/null 2>&1 || true
+              append_case_row "$case_id" "$PROFILE_FOR_MATRIX" "$model_id" "$dtype" "$acceleration" "$concurrency" "$resolved_ref_variants" "$step" "$speed" "$result_json" "$status"
+            done
           done
         done
       done

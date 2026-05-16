@@ -4,7 +4,9 @@ import asyncio
 import csv
 import json
 import math
+import shutil
 import statistics
+import subprocess
 import time
 from dataclasses import asdict
 from dataclasses import dataclass
@@ -27,6 +29,8 @@ class Result:
     status_code: int
     ok: bool
     elapsed_ms: float
+    audio_duration_ms: float
+    rtf: float
     size_bytes: int
     cache_hit: str
     request_id: str
@@ -45,6 +49,8 @@ def percentile(values: list[float], pct: float) -> float:
 def summarize(results: list[Result], total_elapsed: float) -> dict[str, Any]:
     ok_results = [result for result in results if result.ok]
     latencies = [result.elapsed_ms for result in ok_results]
+    audio_durations = [result.audio_duration_ms for result in ok_results if result.audio_duration_ms > 0]
+    rtfs = [result.rtf for result in ok_results if result.rtf > 0]
     total_bytes = sum(result.size_bytes for result in ok_results)
     return {
         "requests": len(results),
@@ -53,6 +59,8 @@ def summarize(results: list[Result], total_elapsed: float) -> dict[str, Any]:
         "total_elapsed_s": round(total_elapsed, 3),
         "requests_per_s": round(len(ok_results) / total_elapsed, 3) if total_elapsed else 0,
         "bytes_downloaded": total_bytes,
+        "audio_duration_ms": round(sum(audio_durations), 2) if audio_durations else 0,
+        "audio_duration_s": round(sum(audio_durations) / 1000, 3) if audio_durations else 0,
         "text_count": len({result.text_index for result in results}),
         "ref_audio_count": len({result.ref_audio_url for result in results}),
         "avg_ms": round(statistics.mean(latencies), 2) if latencies else 0,
@@ -62,6 +70,13 @@ def summarize(results: list[Result], total_elapsed: float) -> dict[str, Any]:
         "p95_ms": round(percentile(latencies, 95), 2),
         "p99_ms": round(percentile(latencies, 99), 2),
         "max_ms": round(max(latencies), 2) if latencies else 0,
+        "avg_rtf": round(statistics.mean(rtfs), 3) if rtfs else 0,
+        "min_rtf": round(min(rtfs), 3) if rtfs else 0,
+        "p50_rtf": round(percentile(rtfs, 50), 3),
+        "p90_rtf": round(percentile(rtfs, 90), 3),
+        "p95_rtf": round(percentile(rtfs, 95), 3),
+        "p99_rtf": round(percentile(rtfs, 99), 3),
+        "max_rtf": round(max(rtfs), 3) if rtfs else 0,
         "cache_hits": sum(1 for result in ok_results if result.cache_hit == "true"),
         "cache_misses": sum(1 for result in ok_results if result.cache_hit == "false"),
     }
@@ -70,6 +85,8 @@ def summarize(results: list[Result], total_elapsed: float) -> dict[str, Any]:
 def summarize_subset(results: list[Result]) -> dict[str, Any]:
     ok_results = [result for result in results if result.ok]
     latencies = [result.elapsed_ms for result in ok_results]
+    audio_durations = [result.audio_duration_ms for result in ok_results if result.audio_duration_ms > 0]
+    rtfs = [result.rtf for result in ok_results if result.rtf > 0]
     return {
         "requests": len(results),
         "ok": len(ok_results),
@@ -81,6 +98,11 @@ def summarize_subset(results: list[Result]) -> dict[str, Any]:
         "p95_ms": round(percentile(latencies, 95), 2),
         "p99_ms": round(percentile(latencies, 99), 2),
         "max_ms": round(max(latencies), 2) if latencies else 0,
+        "audio_duration_ms": round(sum(audio_durations), 2) if audio_durations else 0,
+        "audio_duration_s": round(sum(audio_durations) / 1000, 3) if audio_durations else 0,
+        "avg_rtf": round(statistics.mean(rtfs), 3) if rtfs else 0,
+        "p50_rtf": round(percentile(rtfs, 50), 3),
+        "p95_rtf": round(percentile(rtfs, 95), 3),
         "cache_hits": sum(1 for result in ok_results if result.cache_hit == "true"),
         "cache_misses": sum(1 for result in ok_results if result.cache_hit == "false"),
     }
@@ -156,6 +178,53 @@ def select_ref_audio_index(index: int, total_requests: int, ref_audio_count: int
     raise ValueError(f"Unsupported ref audio selection strategy: {strategy}")
 
 
+def probe_audio_duration_ms(body: bytes, suffix: str) -> tuple[float, str]:
+    if not body:
+        return 0.0, "empty audio body"
+
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe:
+        tmp_path = Path(f"/tmp/omnivoice-benchmark-{time.time_ns()}.{suffix}")
+        try:
+            tmp_path.write_bytes(body)
+            completed = subprocess.run(
+                [
+                    ffprobe,
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    str(tmp_path),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            duration_s = float(completed.stdout.strip())
+            if duration_s > 0:
+                return duration_s * 1000, ""
+            return 0.0, f"ffprobe returned non-positive duration: {duration_s}"
+        except Exception as exc:
+            return 0.0, f"ffprobe duration probe failed: {exc!r}"
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+    try:
+        import io
+
+        import soundfile as sf
+
+        with sf.SoundFile(io.BytesIO(body)) as audio:
+            if audio.samplerate > 0:
+                return (audio.frames / audio.samplerate) * 1000, ""
+        return 0.0, "soundfile returned non-positive samplerate"
+    except Exception as exc:
+        return 0.0, f"audio duration probe unavailable or failed: {exc!r}"
+
+
 async def run_one(
     client: httpx.AsyncClient,
     semaphore: asyncio.Semaphore,
@@ -200,6 +269,8 @@ async def run_one(
                         status_code=response.status_code,
                         ok=False,
                         elapsed_ms=elapsed_ms,
+                        audio_duration_ms=0,
+                        rtf=0,
                         size_bytes=len(body),
                         cache_hit="",
                         request_id=response.headers.get("x-request-id", ""),
@@ -224,6 +295,8 @@ async def run_one(
                             status_code=0,
                             ok=False,
                             elapsed_ms=elapsed_ms,
+                            audio_duration_ms=0,
+                            rtf=0,
                             size_bytes=0,
                             cache_hit=cache_hit,
                             request_id=request_id,
@@ -250,6 +323,8 @@ async def run_one(
                             status_code=500,
                             ok=False,
                             elapsed_ms=elapsed_ms,
+                            audio_duration_ms=0,
+                            rtf=0,
                             size_bytes=0,
                             cache_hit=cache_hit,
                             request_id=request_id,
@@ -264,6 +339,14 @@ async def run_one(
                 cache_hit = response.headers.get("x-cache-hit", cache_hit)
                 transcript = response.headers.get("x-transcript", transcript)
 
+            audio_duration_ms = 0.0
+            rtf = 0.0
+            duration_error = ""
+            if ok:
+                audio_duration_ms, duration_error = probe_audio_duration_ms(body, payload["format"])
+                if audio_duration_ms > 0:
+                    rtf = elapsed_ms / audio_duration_ms
+
             if ok and output_dir:
                 suffix = payload["format"]
                 output_dir.mkdir(parents=True, exist_ok=True)
@@ -276,11 +359,13 @@ async def run_one(
                 status_code=response.status_code,
                 ok=ok,
                 elapsed_ms=elapsed_ms,
+                audio_duration_ms=audio_duration_ms,
+                rtf=rtf,
                 size_bytes=len(body),
                 cache_hit=cache_hit,
                 request_id=request_id,
                 transcript=transcript,
-                error="" if ok else body[:500].decode("utf-8", errors="replace"),
+                error=duration_error if ok and duration_error else ("" if ok else body[:500].decode("utf-8", errors="replace")),
             )
         except Exception as exc:
             elapsed_ms = (time.perf_counter() - started) * 1000
@@ -292,6 +377,8 @@ async def run_one(
                 status_code=0,
                 ok=False,
                 elapsed_ms=elapsed_ms,
+                audio_duration_ms=0,
+                rtf=0,
                 size_bytes=0,
                 cache_hit="",
                 request_id="",
