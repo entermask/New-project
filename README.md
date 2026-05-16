@@ -494,7 +494,16 @@ python scripts/benchmark_tts.py --base-url "$BASE_URL" --token "$API_TOKEN" --re
 python scripts/benchmark_tts.py --base-url "$BASE_URL" --token "$API_TOKEN" --ref-audio-url "$REF_AUDIO_URL" --requests 20 --concurrency 4 --format mp3
 ```
 
-The server-side matrix defaults to `base` acceleration. Set `MATRIX_ACCELERATIONS="base triton"` only when you explicitly want to compare Triton. The matrix value named `MATRIX_CONCURRENCIES` is kept for compatibility with old reports; it now sets both benchmark client concurrency and `OMNIVOICE_BATCH_SIZE`.
+The server-side matrix defaults to `base` acceleration and now includes both short and long logical TTS jobs. Set `MATRIX_ACCELERATIONS="base triton"` only when you explicitly want to compare Triton. The matrix value named `MATRIX_CONCURRENCIES` is kept for compatibility with old reports; it now sets both benchmark client concurrency and `OMNIVOICE_BATCH_SIZE`.
+
+```text
+MATRIX_TEXT_REPEATS="1 20"
+MATRIX_BUSY_BACKLOG_MULTIPLIERS="2 4 8"
+```
+
+`1` benchmarks short text. Values greater than `1` repeat `TEXT` inside each request, so the report exercises chunk split, chunk batching, merge, and final-file behavior.
+
+Busy backlog is swept as `OMNIVOICE_BATCH_SIZE * MATRIX_BUSY_BACKLOG_MULTIPLIERS`. Set `MATRIX_BUSY_BACKLOG_CHUNKS="32 64 128"` when you want exact backlog values instead. The report includes `Accepted`, `429`, and `Non-429 failed`, plus a `Suggested configs` section that picks the best short no-429, long full-accept, and long backpressure tradeoff cases.
 
 Run the server-side matrix benchmark when comparing A100 and H100:
 
@@ -521,6 +530,8 @@ H100 defaults are:
 MATRIX_CONCURRENCIES="8 12 16 24 32"
 MATRIX_DTYPES="fp16"
 MATRIX_STEPS="16 32"
+MATRIX_TEXT_REPEATS="1 20"
+MATRIX_BUSY_BACKLOG_MULTIPLIERS="2 4 8"
 OMNIVOICE_BATCH_MAX_WAIT_MS=50
 ```
 
@@ -536,5 +547,7 @@ A100 defaults are:
 MATRIX_CONCURRENCIES="4 6 8 12"
 MATRIX_DTYPES="fp16"
 MATRIX_STEPS="16 32"
+MATRIX_TEXT_REPEATS="1 20"
+MATRIX_BUSY_BACKLOG_MULTIPLIERS="2 4 8"
 OMNIVOICE_BATCH_MAX_WAIT_MS=100
 ```

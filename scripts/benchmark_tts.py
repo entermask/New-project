@@ -67,6 +67,7 @@ def summarize(results: list[Result], total_elapsed: float) -> dict[str, Any]:
         "failed": len(results) - len(ok_results),
         "accepted": sum(1 for result in results if result.request_id),
         "rejected_429": sum(1 for result in results if result.status_code == 429),
+        "non_429_failed": sum(1 for result in results if not result.ok and result.status_code != 429),
         "status_counts": status_counts,
         "total_elapsed_s": round(total_elapsed, 3),
         "requests_per_s": round(len(ok_results) / total_elapsed, 3) if total_elapsed else 0,
@@ -546,7 +547,8 @@ async def run(args: argparse.Namespace) -> int:
             for result in results:
                 writer.writerow(asdict(result))
 
-    if args.fail_on_error and summary["failed"]:
+    blocking_failures = summary["failed"] - summary["rejected_429"]
+    if args.fail_on_error and blocking_failures:
         return 1
     return 0
 
@@ -602,7 +604,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="", help="Optional directory to save returned audio")
     parser.add_argument("--results-json", default="", help="Optional JSON results output path")
     parser.add_argument("--results-csv", default="", help="Optional CSV results output path")
-    parser.add_argument("--fail-on-error", action="store_true", help="Exit non-zero if any request fails")
+    parser.add_argument(
+        "--fail-on-error",
+        action="store_true",
+        help="Exit non-zero if any non-429 request fails",
+    )
     return parser.parse_args()
 
 

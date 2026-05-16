@@ -33,6 +33,9 @@ Matrix overrides, space-separated:
   MATRIX_STEPS                 Default: 16 32
   MATRIX_SPEEDS                Default: 1.0 1.1
   MATRIX_TEXT_REPEATS          Default: 1 20. Use 1 for short text, >1 for long logical TTS jobs.
+  MATRIX_BUSY_BACKLOG_MULTIPLIERS
+                               Default: 2 4 8. Backlog = OMNIVOICE_BATCH_SIZE * multiplier.
+  MATRIX_BUSY_BACKLOG_CHUNKS   Optional exact backlog values. Overrides multipliers when set.
   MATRIX_REF_AUDIO_VARIANTS    Default: 1 4 requests. Use "requests" for one ref URL variant per request.
 
 Example smoke test:
@@ -117,6 +120,7 @@ if [[ -z "${MATRIX_DTYPES+x}" ]]; then MATRIX_DTYPES="$DEFAULT_DTYPES"; fi
 if [[ -z "${MATRIX_STEPS+x}" ]]; then MATRIX_STEPS="16 32"; fi
 if [[ -z "${MATRIX_SPEEDS+x}" ]]; then MATRIX_SPEEDS="1.0"; fi
 if [[ -z "${MATRIX_TEXT_REPEATS+x}" ]]; then MATRIX_TEXT_REPEATS="1 20"; fi
+if [[ -z "${MATRIX_BUSY_BACKLOG_MULTIPLIERS+x}" ]]; then MATRIX_BUSY_BACKLOG_MULTIPLIERS="2 4 8"; fi
 if [[ -z "${MATRIX_REF_AUDIO_VARIANTS+x}" ]]; then MATRIX_REF_AUDIO_VARIANTS="1 4 requests"; fi
 
 ENV_FILE="$APP_DIR/.env"
@@ -225,12 +229,8 @@ write_case_env() {
   local concurrency="$2"
   local dtype="$3"
   local model_id="$4"
-  local busy_backlog_chunks="${OMNIVOICE_BUSY_BACKLOG_CHUNKS:-}"
+  local busy_backlog_chunks="$5"
   local batch_wait_ms="${OMNIVOICE_BATCH_MAX_WAIT_MS:-$DEFAULT_BATCH_MAX_WAIT_MS}"
-
-  if [[ -z "$busy_backlog_chunks" ]]; then
-    busy_backlog_chunks=$(( concurrency * 2 ))
-  fi
 
   grep -Ev '^(OMNIVOICE_MODEL|OMNIVOICE_ACCELERATION|OMNIVOICE_CONCURRENCY|OMNIVOICE_BATCH_SIZE|OMNIVOICE_BATCH_MAX_WAIT_MS|OMNIVOICE_BATCH_QUEUE_SIZE|OMNIVOICE_MAX_INFLIGHT_JOBS|OMNIVOICE_ENABLE_BATCHING|OMNIVOICE_CHUNK_SIZE_CHARS|OMNIVOICE_BUSY_BACKLOG_CHUNKS|OMNIVOICE_SKIP_MODEL_LOAD|OMNIVOICE_GPU_PROFILE|OMNIVOICE_DTYPE|API_TOKEN)=' "$ENV_BACKUP" > "$ENV_FILE" || true
   {
@@ -304,15 +304,16 @@ append_case_row() {
   local step="$8"
   local speed="$9"
   local text_repeat="${10}"
-  local result_json="${11}"
-  local status="${12}"
+  local busy_backlog_chunks="${11}"
+  local result_json="${12}"
+  local status="${13}"
 
-  "$PYTHON_BIN" - "$case_id" "$profile" "$model_id" "$dtype" "$acceleration" "$concurrency" "$ref_variants" "$step" "$speed" "$text_repeat" "$result_json" "$status" <<'PY' >> "$REPORT_MD"
+  "$PYTHON_BIN" - "$case_id" "$profile" "$model_id" "$dtype" "$acceleration" "$concurrency" "$ref_variants" "$step" "$speed" "$text_repeat" "$busy_backlog_chunks" "$result_json" "$status" <<'PY' >> "$REPORT_MD"
 import json
 import sys
 from pathlib import Path
 
-case_id, profile, model_id, dtype, acceleration, concurrency, ref_variants, step, speed, text_repeat, result_json, status = sys.argv[1:13]
+case_id, profile, model_id, dtype, acceleration, concurrency, ref_variants, step, speed, text_repeat, busy_backlog_chunks, result_json, status = sys.argv[1:14]
 summary = {}
 path = Path(result_json)
 if path.exists():
@@ -325,7 +326,7 @@ def value(name):
     return summary.get(name, "")
 
 print(
-    "| {case} | {profile} | {model} | {dtype} | {accel} | {conc} | {batch} | {refs} | {text_repeat} | {chunks} | {step} | {speed} | {requests} | {ok} | {failed} | {rps} | {avg} | {p50} | {p90} | {p95} | {p99} | {max_ms} | {audio_s} | {avg_rtf} | {p95_rtf} | {hits} | {misses} | {status} |".format(
+    "| {case} | {profile} | {model} | {dtype} | {accel} | {conc} | {batch} | {backlog} | {refs} | {text_repeat} | {chunks} | {step} | {speed} | {requests} | {accepted} | {rejected_429} | {ok} | {failed} | {non_429_failed} | {rps} | {avg} | {p50} | {p90} | {p95} | {p99} | {max_ms} | {audio_s} | {avg_rtf} | {p95_rtf} | {hits} | {misses} | {status} |".format(
         case=case_id,
         profile=profile,
         model=model_id,
@@ -333,14 +334,18 @@ print(
         accel=acceleration,
         conc=concurrency,
         batch=concurrency,
+        backlog=busy_backlog_chunks,
         refs=ref_variants,
         text_repeat=text_repeat,
         chunks=value("chunks_total"),
         step=step,
         speed=speed,
         requests=value("requests"),
+        accepted=value("accepted"),
+        rejected_429=value("rejected_429"),
         ok=value("ok"),
         failed=value("failed"),
+        non_429_failed=value("non_429_failed"),
         rps=value("requests_per_s"),
         avg=value("avg_ms"),
         p50=value("p50_ms"),
@@ -436,6 +441,46 @@ resolve_ref_variants() {
   esac
 }
 
+resolve_busy_backlogs() {
+  local batch_size="$1"
+  local value
+
+  if [[ -n "${MATRIX_BUSY_BACKLOG_CHUNKS:-}" ]]; then
+    for value in $MATRIX_BUSY_BACKLOG_CHUNKS; do
+      case "$value" in
+        ''|*[!0-9]*)
+          echo "MATRIX_BUSY_BACKLOG_CHUNKS values must be positive integers: $value" >&2
+          return 1
+          ;;
+        0)
+          echo "MATRIX_BUSY_BACKLOG_CHUNKS values must be >= 1: $value" >&2
+          return 1
+          ;;
+        *)
+          printf '%s\n' "$value"
+          ;;
+      esac
+    done
+    return 0
+  fi
+
+  for value in $MATRIX_BUSY_BACKLOG_MULTIPLIERS; do
+    case "$value" in
+      ''|*[!0-9]*)
+        echo "MATRIX_BUSY_BACKLOG_MULTIPLIERS values must be positive integers: $value" >&2
+        return 1
+        ;;
+      0)
+        echo "MATRIX_BUSY_BACKLOG_MULTIPLIERS values must be >= 1: $value" >&2
+        return 1
+        ;;
+      *)
+        printf '%s\n' "$(( batch_size * value ))"
+        ;;
+    esac
+  done
+}
+
 {
   echo "# OmniVoice TTS Benchmark Report"
   echo
@@ -453,6 +498,11 @@ resolve_ref_variants() {
   echo "- Dtype matrix: $MATRIX_DTYPES"
   echo "- Concurrency matrix: $MATRIX_CONCURRENCIES"
   echo "- Text repeat matrix: $MATRIX_TEXT_REPEATS"
+  if [[ -n "${MATRIX_BUSY_BACKLOG_CHUNKS:-}" ]]; then
+    echo "- Busy backlog chunks matrix: $MATRIX_BUSY_BACKLOG_CHUNKS"
+  else
+    echo "- Busy backlog multiplier matrix: $MATRIX_BUSY_BACKLOG_MULTIPLIERS"
+  fi
   echo "- Reference audio variant matrix: $MATRIX_REF_AUDIO_VARIANTS"
   echo "- Step matrix: $MATRIX_STEPS"
   echo "- Batch max wait ms: ${OMNIVOICE_BATCH_MAX_WAIT_MS:-$DEFAULT_BATCH_MAX_WAIT_MS}"
@@ -462,8 +512,8 @@ resolve_ref_variants() {
   echo
   echo "## Results"
   echo
-  echo "| Case | Profile | Model | Dtype | Accel | Concurrency | Batch | Ref variants | Text x | Chunks | Step | Speed | Requests | OK | Failed | RPS | Avg ms | P50 | P90 | P95 | P99 | Max ms | Audio s | Avg RTF | P95 RTF | Cache hit | Cache miss | Status |"
-  echo "| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
+  echo "| Case | Profile | Model | Dtype | Accel | Concurrency | Batch | Backlog | Ref variants | Text x | Chunks | Step | Speed | Requests | Accepted | 429 | OK | Failed | Non-429 failed | RPS | Avg ms | P50 | P90 | P95 | P99 | Max ms | Audio s | Avg RTF | P95 RTF | Cache hit | Cache miss | Status |"
+  echo "| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
 } > "$REPORT_MD"
 
 read -r -a MODELS <<< "$MATRIX_MODELS"
@@ -487,39 +537,40 @@ for model_id in "${MODELS[@]}"; do
       fi
 
       for concurrency in "${CONCURRENCIES[@]}"; do
-        write_case_env "$acceleration" "$concurrency" "$dtype" "$model_id"
-        echo "Restarting API: profile=$PROFILE_FOR_MATRIX model=$model_id dtype=$dtype acceleration=$acceleration concurrency=$concurrency batch=$concurrency"
-        restart_log="$LOG_DIR/restart-${PROFILE_FOR_MATRIX}-${model_slug}-${dtype}-${acceleration}-c${concurrency}.log"
-        set +e
-        RESTART=1 APP_DIR="$APP_DIR" VENV_DIR="$VENV_DIR" PORT="$PORT" "$RUN_TMUX" > "$restart_log" 2>&1
-        restart_rc=$?
-        set -e
+        for busy_backlog_chunks in $(resolve_busy_backlogs "$concurrency"); do
+          write_case_env "$acceleration" "$concurrency" "$dtype" "$model_id" "$busy_backlog_chunks"
+          echo "Restarting API: profile=$PROFILE_FOR_MATRIX model=$model_id dtype=$dtype acceleration=$acceleration batch=$concurrency backlog=$busy_backlog_chunks"
+          restart_log="$LOG_DIR/restart-${PROFILE_FOR_MATRIX}-${model_slug}-${dtype}-${acceleration}-c${concurrency}-bb${busy_backlog_chunks}.log"
+          set +e
+          RESTART=1 APP_DIR="$APP_DIR" VENV_DIR="$VENV_DIR" PORT="$PORT" "$RUN_TMUX" > "$restart_log" 2>&1
+          restart_rc=$?
+          set -e
 
-        if (( restart_rc != 0 )); then
-          echo "Restart failed for profile=$PROFILE_FOR_MATRIX model=$model_id dtype=$dtype acceleration=$acceleration concurrency=$concurrency, see $restart_log"
+          if (( restart_rc != 0 )); then
+            echo "Restart failed for profile=$PROFILE_FOR_MATRIX model=$model_id dtype=$dtype acceleration=$acceleration batch=$concurrency backlog=$busy_backlog_chunks, see $restart_log"
+            for text_repeat in "${TEXT_REPEATS[@]}"; do
+              for ref_variants in "${REF_VARIANTS[@]}"; do
+                resolved_ref_variants="$(resolve_ref_variants "$ref_variants")"
+                for step in "${STEPS[@]}"; do
+                  for speed in "${SPEEDS[@]}"; do
+                    speed_id="${speed//./p}"
+                    case_id="${PROFILE_FOR_MATRIX}-${model_slug}-${dtype}-${acceleration}-c${concurrency}-bb${busy_backlog_chunks}-tx${text_repeat}-refs${ref_variants}-step${step}-speed${speed_id}"
+                    append_case_row "$case_id" "$PROFILE_FOR_MATRIX" "$model_id" "$dtype" "$acceleration" "$concurrency" "$resolved_ref_variants" "$step" "$speed" "$text_repeat" "$busy_backlog_chunks" "$CASE_DIR/$case_id.json" "restart_failed_rc_${restart_rc}"
+                    FAILED_CASES=$((FAILED_CASES + 1))
+                  done
+                done
+              done
+            done
+            continue
+          fi
+
           for text_repeat in "${TEXT_REPEATS[@]}"; do
             for ref_variants in "${REF_VARIANTS[@]}"; do
               resolved_ref_variants="$(resolve_ref_variants "$ref_variants")"
               for step in "${STEPS[@]}"; do
                 for speed in "${SPEEDS[@]}"; do
-                  speed_id="${speed//./p}"
-                  case_id="${PROFILE_FOR_MATRIX}-${model_slug}-${dtype}-${acceleration}-c${concurrency}-tx${text_repeat}-refs${ref_variants}-step${step}-speed${speed_id}"
-                  append_case_row "$case_id" "$PROFILE_FOR_MATRIX" "$model_id" "$dtype" "$acceleration" "$concurrency" "$resolved_ref_variants" "$step" "$speed" "$text_repeat" "$CASE_DIR/$case_id.json" "restart_failed_rc_${restart_rc}"
-                  FAILED_CASES=$((FAILED_CASES + 1))
-                done
-              done
-            done
-          done
-          continue
-        fi
-
-        for text_repeat in "${TEXT_REPEATS[@]}"; do
-          for ref_variants in "${REF_VARIANTS[@]}"; do
-            resolved_ref_variants="$(resolve_ref_variants "$ref_variants")"
-            for step in "${STEPS[@]}"; do
-              for speed in "${SPEEDS[@]}"; do
                 speed_id="${speed//./p}"
-                case_id="${PROFILE_FOR_MATRIX}-${model_slug}-${dtype}-${acceleration}-c${concurrency}-tx${text_repeat}-refs${ref_variants}-step${step}-speed${speed_id}"
+                case_id="${PROFILE_FOR_MATRIX}-${model_slug}-${dtype}-${acceleration}-c${concurrency}-bb${busy_backlog_chunks}-tx${text_repeat}-refs${ref_variants}-step${step}-speed${speed_id}"
                 result_json="$CASE_DIR/$case_id.json"
                 result_csv="$CASE_DIR/$case_id.csv"
                 case_audio_dir="$AUDIO_DIR/$case_id"
@@ -533,7 +584,7 @@ for model_id in "${MODELS[@]}"; do
                   echo "Health check timed out for $case_id" | tee "$case_log"
                   status="health_timeout"
                   FAILED_CASES=$((FAILED_CASES + 1))
-                  append_case_row "$case_id" "$PROFILE_FOR_MATRIX" "$model_id" "$dtype" "$acceleration" "$concurrency" "$resolved_ref_variants" "$step" "$speed" "$text_repeat" "$result_json" "$status" "$before_health" "$after_health"
+                  append_case_row "$case_id" "$PROFILE_FOR_MATRIX" "$model_id" "$dtype" "$acceleration" "$concurrency" "$resolved_ref_variants" "$step" "$speed" "$text_repeat" "$busy_backlog_chunks" "$result_json" "$status" "$before_health" "$after_health"
                   continue
                 fi
 
@@ -580,15 +631,98 @@ for model_id in "${MODELS[@]}"; do
                 fi
 
                 curl -fsS "$BASE_URL/health" -o "$after_health" >/dev/null 2>&1 || true
-                append_case_row "$case_id" "$PROFILE_FOR_MATRIX" "$model_id" "$dtype" "$acceleration" "$concurrency" "$resolved_ref_variants" "$step" "$speed" "$text_repeat" "$result_json" "$status" "$before_health" "$after_health"
+                append_case_row "$case_id" "$PROFILE_FOR_MATRIX" "$model_id" "$dtype" "$acceleration" "$concurrency" "$resolved_ref_variants" "$step" "$speed" "$text_repeat" "$busy_backlog_chunks" "$result_json" "$status" "$before_health" "$after_health"
               done
             done
           done
+        done
         done
       done
     done
   done
 done
+
+{
+  echo
+  echo "## Suggested configs"
+  echo
+} >> "$REPORT_MD"
+
+"$PYTHON_BIN" - "$CASE_DIR" <<'PY' >> "$REPORT_MD"
+import json
+import re
+import sys
+from pathlib import Path
+
+case_dir = Path(sys.argv[1])
+pattern = re.compile(r"-c(?P<batch>\d+)-bb(?P<backlog>\d+)-tx(?P<text_repeat>\d+)-")
+rows = []
+
+for path in sorted(case_dir.glob("*.json")):
+    match = pattern.search(path.stem)
+    if not match:
+        continue
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        continue
+    summary = payload.get("summary", {})
+    non_429_failed = int(summary.get("non_429_failed") or 0)
+    if non_429_failed:
+        continue
+    rows.append(
+        {
+            "case": path.stem,
+            "batch": int(match.group("batch")),
+            "backlog": int(match.group("backlog")),
+            "text_repeat": int(match.group("text_repeat")),
+            "requests": int(summary.get("requests") or 0),
+            "accepted": int(summary.get("accepted") or 0),
+            "rejected_429": int(summary.get("rejected_429") or 0),
+            "ok": int(summary.get("ok") or 0),
+            "rps": float(summary.get("requests_per_s") or 0),
+            "p95": float(summary.get("p95_ms") or 0),
+            "avg_rtf": float(summary.get("avg_rtf") or 0),
+            "chunks": int(summary.get("chunks_total") or 0),
+        }
+    )
+
+def describe(label, candidates):
+    if not candidates:
+        print(f"- {label}: no valid case found.")
+        return
+    row = candidates[0]
+    print(
+        "- {label}: batch={batch}, backlog={backlog}, tx={tx}, accepted={accepted}/{requests}, "
+        "429={rejected}, rps={rps:.3f}, p95={p95:.0f}ms, avg_rtf={rtf:.3f} ({case})".format(
+            label=label,
+            batch=row["batch"],
+            backlog=row["backlog"],
+            tx=row["text_repeat"],
+            accepted=row["accepted"],
+            requests=row["requests"],
+            rejected=row["rejected_429"],
+            rps=row["rps"],
+            p95=row["p95"],
+            rtf=row["avg_rtf"],
+            case=row["case"],
+        )
+    )
+
+short_rows = [row for row in rows if row["text_repeat"] == 1 and row["rejected_429"] == 0 and row["ok"] == row["requests"]]
+short_rows.sort(key=lambda row: (-row["rps"], row["p95"], row["batch"], row["backlog"]))
+describe("Best short no-429 throughput", short_rows)
+
+long_rows = [row for row in rows if row["text_repeat"] > 1 and row["rejected_429"] == 0 and row["ok"] == row["requests"]]
+long_rows.sort(key=lambda row: (-row["rps"], row["p95"], row["batch"], row["backlog"]))
+describe("Best long full-accept throughput", long_rows)
+
+long_backpressure_rows = [row for row in rows if row["text_repeat"] > 1]
+long_backpressure_rows.sort(
+    key=lambda row: (-row["accepted"], row["rejected_429"], -row["rps"], row["p95"], row["batch"], row["backlog"])
+)
+describe("Best long backpressure tradeoff", long_backpressure_rows)
+PY
 
 {
   echo
