@@ -9,8 +9,6 @@ CONFIGURE_UFW="${CONFIGURE_UFW:-1}"
 ENABLE_UFW="${ENABLE_UFW:-0}"
 APP_PORT="${APP_PORT:-8001}"
 SSH_PORT="${SSH_PORT:-22}"
-INSTALL_TORCH_CUDA="${INSTALL_TORCH_CUDA:-auto}"
-TORCH_CUDA_INDEX_URL="${TORCH_CUDA_INDEX_URL:-https://download.pytorch.org/whl/cu121}"
 
 if command -v sudo >/dev/null 2>&1; then
   SUDO=(sudo)
@@ -112,42 +110,6 @@ install_nvidia_driver_if_needed() {
   echo "NVIDIA driver install finished. A reboot or instance restart may be required before nvidia-smi works."
 }
 
-detect_gpu_name() {
-  if command -v nvidia-smi >/dev/null 2>&1; then
-    nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -n 1 || true
-  fi
-}
-
-should_install_torch_cuda() {
-  case "$INSTALL_TORCH_CUDA" in
-    1|true|yes)
-      return 0
-      ;;
-    0|false|no)
-      return 1
-      ;;
-    auto)
-      local gpu_name
-      gpu_name="$(detect_gpu_name)"
-      [[ "$gpu_name" == *"L40S"* ]]
-      return
-      ;;
-    *)
-      echo "INSTALL_TORCH_CUDA must be auto, 1, or 0." >&2
-      exit 1
-      ;;
-  esac
-}
-
-install_torch_cuda_if_needed() {
-  if should_install_torch_cuda; then
-    echo "Installing PyTorch CUDA wheels from $TORCH_CUDA_INDEX_URL..."
-    python -m pip install torch torchvision torchaudio --index-url "$TORCH_CUDA_INDEX_URL"
-  else
-    echo "Skipping explicit PyTorch CUDA wheel install. Set INSTALL_TORCH_CUDA=1 to force it."
-  fi
-}
-
 install_system_packages
 configure_firewall
 install_nvidia_driver_if_needed
@@ -168,7 +130,6 @@ echo "Using Python: $("$PYTHON" --version) at $PYTHON"
 source "$VENV_DIR/bin/activate"
 
 python -m pip install -U pip wheel
-install_torch_cuda_if_needed
 python -m pip install -r requirements.txt
 
 cp .env.example .env
