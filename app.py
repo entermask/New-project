@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,27 +51,45 @@ REQUEST_TIMEOUT = float(os.getenv("OMNIVOICE_REQUEST_TIMEOUT", "300"))
 JOB_TTL_SECONDS = int(os.getenv("OMNIVOICE_JOB_TTL_SECONDS", "3600"))
 MAX_INFLIGHT_JOBS = max(1, int(os.getenv("OMNIVOICE_MAX_INFLIGHT_JOBS", "20")))
 SKIP_MODEL_LOAD = os.getenv("OMNIVOICE_SKIP_MODEL_LOAD", "0") == "1"
+GPU_PROFILE = os.getenv("OMNIVOICE_GPU_PROFILE", "auto").lower().strip()
+MODEL_DTYPE = os.getenv("OMNIVOICE_DTYPE", "fp16").lower().strip()
 ACCELERATION = os.getenv("OMNIVOICE_ACCELERATION", "base").lower().strip()
 ENABLE_BATCHING = os.getenv("OMNIVOICE_ENABLE_BATCHING", "1") == "1"
 BATCH_SIZE = max(1, int(os.getenv("OMNIVOICE_BATCH_SIZE", str(MAX_CONCURRENCY))))
 BATCH_MAX_WAIT_MS = max(0.0, float(os.getenv("OMNIVOICE_BATCH_MAX_WAIT_MS", "100")))
 BATCH_QUEUE_SIZE = max(1, int(os.getenv("OMNIVOICE_BATCH_QUEUE_SIZE", "256")))
-BATCH_TEXT_LENGTH_THRESHOLD = max(1, int(os.getenv("OMNIVOICE_BATCH_TEXT_LENGTH_THRESHOLD", "100")))
+ENABLE_PROMPT_CACHE = os.getenv("OMNIVOICE_ENABLE_PROMPT_CACHE", "1") == "1"
+PROMPT_CACHE_SIZE = max(0, int(os.getenv("OMNIVOICE_PROMPT_CACHE_SIZE", "64")))
+PROMPT_CACHE_TTL_SECONDS = max(0, int(os.getenv("OMNIVOICE_PROMPT_CACHE_TTL_SECONDS", "3600")))
 DEFERRED_MAX_SIZE = BATCH_QUEUE_SIZE * 2
 JOB_CLEANUP_INTERVAL_SECONDS = 60
 
 SUPPORTED_FORMATS = {"wav", "mp3"}
 SUPPORTED_ACCELERATIONS = {"base", "triton", "hybrid"}
+SUPPORTED_GPU_PROFILES = {"auto", "generic", "a100", "h100"}
+SUPPORTED_MODEL_DTYPES = {"fp16", "bf16"}
 REF_AUDIO_DIR = CACHE_DIR / "ref-audio"
 TRANSCRIPT_DIR = CACHE_DIR / "transcripts"
 TMP_DIR = CACHE_DIR / "tmp"
 JOB_DIR = CACHE_DIR / "jobs"
 
 
+@dataclass
+class PromptCacheEntry:
+    prompt: object
+    transcript: str
+    created_at: float
+    last_used_at: float
+    hits: int = 0
+
+
 app = FastAPI(title="OmniVoice API", version="1.0.0")
 model = None
 model_runner = None
 model_loaded = False
+resolved_gpu_name: Optional[str] = None
+resolved_gpu_profile: Optional[str] = None
+resolved_model_dtype: Optional[str] = None
 generation_semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
 generation_queue: asyncio.Queue["BatchGenerationItem"] = asyncio.Queue(maxsize=BATCH_QUEUE_SIZE)
 generation_batch_worker_task: Optional[asyncio.Task] = None
@@ -86,6 +105,11 @@ cache_locks: dict[str, asyncio.Lock] = {}
 cache_locks_guard = asyncio.Lock()
 prompt_locks: dict[str, threading.Lock] = {}
 prompt_locks_guard = threading.Lock()
+voice_clone_prompt_cache: OrderedDict[tuple[str, ...], PromptCacheEntry] = OrderedDict()
+voice_clone_prompt_cache_lock = threading.RLock()
+voice_clone_prompt_cache_hits = 0
+voice_clone_prompt_cache_misses = 0
+voice_clone_prompt_cache_evictions = 0
 tts_jobs: dict[str, "TTSJob"] = {}
 tts_jobs_lock = asyncio.Lock()
 
@@ -202,6 +226,97 @@ def _get_prompt_lock(key: str) -> threading.Lock:
         return lock
 
 
+def _prompt_cache_enabled() -> bool:
+    return ENABLE_PROMPT_CACHE and PROMPT_CACHE_SIZE > 0
+
+
+def _voice_clone_prompt_cache_key(audio_path: Path, transcript: str) -> tuple[str, ...]:
+    return (
+        MODEL_NAME,
+        ACCELERATION,
+        resolved_gpu_profile or GPU_PROFILE,
+        resolved_model_dtype or MODEL_DTYPE,
+        str(audio_path),
+        transcript.strip(),
+    )
+
+
+def _evict_expired_voice_clone_prompts_locked(now: float) -> None:
+    global voice_clone_prompt_cache_evictions
+    if PROMPT_CACHE_TTL_SECONDS <= 0:
+        return
+    expired_keys = [
+        key
+        for key, entry in voice_clone_prompt_cache.items()
+        if now - entry.last_used_at > PROMPT_CACHE_TTL_SECONDS
+    ]
+    for key in expired_keys:
+        del voice_clone_prompt_cache[key]
+    voice_clone_prompt_cache_evictions += len(expired_keys)
+
+
+def _get_cached_voice_clone_prompt(
+    key: tuple[str, ...],
+    *,
+    count_miss: bool = True,
+) -> Optional[object]:
+    global voice_clone_prompt_cache_hits, voice_clone_prompt_cache_misses
+    if not _prompt_cache_enabled():
+        return None
+
+    now = time.time()
+    with voice_clone_prompt_cache_lock:
+        _evict_expired_voice_clone_prompts_locked(now)
+        entry = voice_clone_prompt_cache.get(key)
+        if entry is None:
+            if count_miss:
+                voice_clone_prompt_cache_misses += 1
+            return None
+
+        entry.hits += 1
+        entry.last_used_at = now
+        voice_clone_prompt_cache.move_to_end(key)
+        voice_clone_prompt_cache_hits += 1
+        return entry.prompt
+
+
+def _store_voice_clone_prompt(
+    key: tuple[str, ...],
+    prompt: object,
+    transcript: str,
+) -> None:
+    global voice_clone_prompt_cache_evictions
+    if not _prompt_cache_enabled():
+        return
+
+    now = time.time()
+    with voice_clone_prompt_cache_lock:
+        _evict_expired_voice_clone_prompts_locked(now)
+        voice_clone_prompt_cache[key] = PromptCacheEntry(
+            prompt=prompt,
+            transcript=transcript.strip(),
+            created_at=now,
+            last_used_at=now,
+        )
+        voice_clone_prompt_cache.move_to_end(key)
+        while len(voice_clone_prompt_cache) > PROMPT_CACHE_SIZE:
+            voice_clone_prompt_cache.popitem(last=False)
+            voice_clone_prompt_cache_evictions += 1
+
+
+def _voice_clone_prompt_cache_metrics() -> dict[str, object]:
+    with voice_clone_prompt_cache_lock:
+        return {
+            "voice_clone_prompt_cache_enabled": _prompt_cache_enabled(),
+            "voice_clone_prompt_cache_size": len(voice_clone_prompt_cache),
+            "voice_clone_prompt_cache_max_size": PROMPT_CACHE_SIZE,
+            "voice_clone_prompt_cache_ttl_seconds": PROMPT_CACHE_TTL_SECONDS,
+            "voice_clone_prompt_cache_hits": voice_clone_prompt_cache_hits,
+            "voice_clone_prompt_cache_misses": voice_clone_prompt_cache_misses,
+            "voice_clone_prompt_cache_evictions": voice_clone_prompt_cache_evictions,
+        }
+
+
 async def _download_ref_audio(ref_audio_url: str, target: Path) -> None:
     tmp_target = target.with_suffix(f"{target.suffix}.tmp")
     async with httpx.AsyncClient(follow_redirects=True, timeout=DOWNLOAD_TIMEOUT) as client:
@@ -239,8 +354,53 @@ async def _resolve_reference(req: TTSRequest) -> ReferenceCacheEntry:
         )
 
 
+def _cuda_device_index() -> int:
+    if DEVICE_MAP.startswith("cuda:"):
+        try:
+            return int(DEVICE_MAP.split(":", 1)[1])
+        except ValueError:
+            return 0
+    return 0
+
+
+def _gpu_profile_from_name(gpu_name: Optional[str]) -> str:
+    name = (gpu_name or "").lower()
+    if "h100" in name or "h200" in name:
+        return "h100"
+    if "a100" in name:
+        return "a100"
+    return "generic"
+
+
+def _resolve_gpu_profile(gpu_name: Optional[str]) -> str:
+    if GPU_PROFILE not in SUPPORTED_GPU_PROFILES:
+        raise ValueError(
+            "OMNIVOICE_GPU_PROFILE must be one of: "
+            f"{', '.join(sorted(SUPPORTED_GPU_PROFILES))}"
+        )
+    if GPU_PROFILE == "auto":
+        return _gpu_profile_from_name(gpu_name)
+    return GPU_PROFILE
+
+
+def _resolve_model_dtype() -> str:
+    if MODEL_DTYPE not in SUPPORTED_MODEL_DTYPES:
+        raise ValueError(
+            "OMNIVOICE_DTYPE must be one of: "
+            f"{', '.join(sorted(SUPPORTED_MODEL_DTYPES))}"
+        )
+    return MODEL_DTYPE
+
+
+def _torch_dtype(torch_module: object, dtype_name: str) -> object:
+    if dtype_name == "bf16":
+        return torch_module.bfloat16
+    return torch_module.float16
+
+
 def _load_model() -> None:
     global model, model_loaded, model_runner
+    global resolved_gpu_name, resolved_gpu_profile, resolved_model_dtype
     if SKIP_MODEL_LOAD:
         logger.warning("OMNIVOICE_SKIP_MODEL_LOAD=1; model loading is disabled.")
         model_loaded = False
@@ -253,11 +413,21 @@ def _load_model() -> None:
 
     import torch
 
+    gpu_name = None
+    if torch.cuda.is_available():
+        gpu_index = _cuda_device_index()
+        if gpu_index < torch.cuda.device_count():
+            gpu_name = torch.cuda.get_device_name(gpu_index)
+    gpu_profile = _resolve_gpu_profile(gpu_name)
+    model_dtype = _resolve_model_dtype()
+
     logger.info(
-        "Loading OmniVoice model=%s device=%s acceleration=%s ...",
+        "Loading OmniVoice model=%s device=%s acceleration=%s gpu_profile=%s dtype=%s ...",
         MODEL_NAME,
         DEVICE_MAP,
         ACCELERATION,
+        gpu_profile,
+        model_dtype,
     )
     if ACCELERATION in {"triton", "hybrid"}:
         from omnivoice_triton import create_runner
@@ -266,7 +436,7 @@ def _load_model() -> None:
             ACCELERATION,
             device=DEVICE_MAP,
             model_id=MODEL_NAME,
-            dtype="fp16",
+            dtype=model_dtype,
         )
         runner.load_model()
         runner.model.load_asr_model(model_name=ASR_MODEL_NAME)
@@ -278,12 +448,20 @@ def _load_model() -> None:
         model = OmniVoice.from_pretrained(
             MODEL_NAME,
             device_map=DEVICE_MAP,
-            dtype=torch.float16,
+            dtype=_torch_dtype(torch, model_dtype),
             load_asr=True,
             asr_model_name=ASR_MODEL_NAME,
         )
+    resolved_gpu_name = gpu_name
+    resolved_gpu_profile = gpu_profile
+    resolved_model_dtype = model_dtype
     model_loaded = True
-    logger.info("OmniVoice model loaded with acceleration=%s.", ACCELERATION)
+    logger.info(
+        "OmniVoice model loaded with acceleration=%s gpu_profile=%s dtype=%s.",
+        ACCELERATION,
+        gpu_profile,
+        model_dtype,
+    )
 
 
 def _generation_kwargs(reqs: list[TTSRequest], voice_clone_prompts: list[object]) -> dict[str, object]:
@@ -302,28 +480,40 @@ def _create_voice_clone_prompt(req: TTSRequest, ref: ReferenceCacheEntry) -> obj
     if model is None:
         raise RuntimeError("OmniVoice model is not loaded.")
 
-    ref_text = ref.transcript
-    if not ref_text:
-        lock = _get_prompt_lock(str(ref.audio_path))
-        with lock:
-            ref_text = _read_transcript(req.ref_audio_url)
-            voice_clone_prompt = model.create_voice_clone_prompt(
-                ref_audio=str(ref.audio_path),
-                ref_text=ref_text,
-            )
-            resolved_transcript = voice_clone_prompt.ref_text
-            if resolved_transcript:
-                _write_transcript(req.ref_audio_url, resolved_transcript)
-            return voice_clone_prompt
+    ref_text = (ref.transcript or "").strip()
+    miss_counted = False
+    if ref_text:
+        cache_key = _voice_clone_prompt_cache_key(ref.audio_path, ref_text)
+        cached_prompt = _get_cached_voice_clone_prompt(cache_key)
+        miss_counted = cached_prompt is None
+        if cached_prompt is not None:
+            return cached_prompt
 
-    voice_clone_prompt = model.create_voice_clone_prompt(
-        ref_audio=str(ref.audio_path),
-        ref_text=ref_text,
-    )
-    resolved_transcript = voice_clone_prompt.ref_text
-    if resolved_transcript:
-        _write_transcript(req.ref_audio_url, resolved_transcript)
-    return voice_clone_prompt
+    lock = _get_prompt_lock(str(ref.audio_path))
+    with lock:
+        ref_text = ref_text or (_read_transcript(req.ref_audio_url) or "").strip()
+        cache_key = _voice_clone_prompt_cache_key(ref.audio_path, ref_text)
+        cached_prompt = _get_cached_voice_clone_prompt(cache_key, count_miss=not miss_counted)
+        if cached_prompt is not None:
+            return cached_prompt
+
+        voice_clone_prompt = model.create_voice_clone_prompt(
+            ref_audio=str(ref.audio_path),
+            ref_text=ref_text or None,
+        )
+        resolved_transcript = (voice_clone_prompt.ref_text or "").strip()
+        if resolved_transcript:
+            _write_transcript(req.ref_audio_url, resolved_transcript)
+
+        if resolved_transcript:
+            resolved_key = _voice_clone_prompt_cache_key(ref.audio_path, resolved_transcript)
+            _store_voice_clone_prompt(resolved_key, voice_clone_prompt, resolved_transcript)
+            if ref_text and resolved_transcript != ref_text:
+                _store_voice_clone_prompt(cache_key, voice_clone_prompt, resolved_transcript)
+        else:
+            _store_voice_clone_prompt(cache_key, voice_clone_prompt, ref_text)
+
+        return voice_clone_prompt
 
 
 def _generate_wav(req: TTSRequest, ref: ReferenceCacheEntry, output_path: Path) -> str:
@@ -344,22 +534,21 @@ def _generate_wav_batch(items: list[BatchGenerationItem]) -> list[str]:
 
     unique_refs = len({str(item.ref.audio_path) for item in items})
     logger.info(
-        "Batch generate: items=%d unique_refs=%d text_bucket=%s num_step=%d",
+        "Batch generate: items=%d unique_refs=%d num_step=%d",
         len(items),
         unique_refs,
-        _text_length_bucket(items[0].req.text),
         items[0].req.num_step,
     )
 
     prompt_start = time.monotonic()
-    prompt_cache: dict[tuple[str, Optional[str]], object] = {}
+    batch_prompt_cache: dict[tuple[str, Optional[str]], object] = {}
     prompts = []
     for item in items:
         cache_key = (str(item.ref.audio_path), item.ref.transcript)
-        prompt = prompt_cache.get(cache_key)
+        prompt = batch_prompt_cache.get(cache_key)
         if prompt is None:
             prompt = _create_voice_clone_prompt(item.req, item.ref)
-            prompt_cache[cache_key] = prompt
+            batch_prompt_cache[cache_key] = prompt
         prompts.append(prompt)
     prompt_elapsed = time.monotonic() - prompt_start
 
@@ -382,7 +571,7 @@ def _generate_wav_batch(items: list[BatchGenerationItem]) -> list[str]:
         prompt_elapsed * 1000,
         gen_elapsed * 1000,
         write_elapsed * 1000,
-        len(items) - len(prompt_cache),
+        len(items) - len(batch_prompt_cache),
     )
     return transcripts
 
@@ -470,9 +659,9 @@ async def _get_runtime_metrics() -> dict[str, object]:
             "batch_size": BATCH_SIZE,
             "batch_max_wait_ms": BATCH_MAX_WAIT_MS,
             "batch_queue_size": BATCH_QUEUE_SIZE,
-            "batch_text_length_threshold": BATCH_TEXT_LENGTH_THRESHOLD,
             "max_inflight_jobs": MAX_INFLIGHT_JOBS,
             "tts_jobs": job_counts,
+            **_voice_clone_prompt_cache_metrics(),
         }
 
 
@@ -480,30 +669,23 @@ def _inflight_job_count_locked() -> int:
     return sum(1 for job in tts_jobs.values() if job.status in {"queued", "running"})
 
 
-def _text_length_bucket(text: str) -> str:
-    if len(text.strip()) < BATCH_TEXT_LENGTH_THRESHOLD:
-        return "short"
-    return "long"
-
-
-def _batch_generation_key(item: BatchGenerationItem) -> tuple[int, Optional[float], Optional[str], str]:
+def _batch_generation_key(item: BatchGenerationItem) -> tuple[int, Optional[float], Optional[str]]:
     return (
         item.req.num_step,
         item.req.speed,
         item.req.language,
-        _text_length_bucket(item.req.text),
     )
 
 
 def _group_batch_items(items: list[BatchGenerationItem]) -> list[list[BatchGenerationItem]]:
-    groups: dict[tuple[int, Optional[float], Optional[str], str], list[BatchGenerationItem]] = {}
+    groups: dict[tuple[int, Optional[float], Optional[str]], list[BatchGenerationItem]] = {}
     for item in items:
         groups.setdefault(_batch_generation_key(item), []).append(item)
     return list(groups.values())
 
 
 def _take_deferred_generation_item(
-    key: Optional[tuple[int, Optional[float], Optional[str], str]] = None,
+    key: Optional[tuple[int, Optional[float], Optional[str]]] = None,
 ) -> Optional[BatchGenerationItem]:
     if not deferred_generation_items:
         return None
@@ -841,20 +1023,25 @@ async def shutdown() -> None:
 
 @app.get("/health")
 async def health() -> dict[str, object]:
-    gpu = None
+    gpu = resolved_gpu_name
     try:
         import torch
 
-        if torch.cuda.is_available():
-            gpu = torch.cuda.get_device_name(0)
+        if gpu is None and torch.cuda.is_available():
+            gpu_index = _cuda_device_index()
+            if gpu_index < torch.cuda.device_count():
+                gpu = torch.cuda.get_device_name(gpu_index)
     except Exception:
-        gpu = None
+        gpu = resolved_gpu_name
 
     runtime_metrics = await _get_runtime_metrics()
     return {
         "status": "ok",
         "model_loaded": model_loaded,
         "gpu": gpu,
+        "gpu_profile": resolved_gpu_profile or _gpu_profile_from_name(gpu),
+        "requested_gpu_profile": GPU_PROFILE,
+        "dtype": resolved_model_dtype or MODEL_DTYPE,
         "cache_audio_count": len(list(REF_AUDIO_DIR.glob("*"))),
         "cache_transcript_count": len(list(TRANSCRIPT_DIR.glob("*.json"))),
         "acceleration": ACCELERATION,
