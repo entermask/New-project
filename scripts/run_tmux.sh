@@ -2,7 +2,9 @@
 set -euo pipefail
 
 SESSION_NAME="${SESSION_NAME:-omnivoice}"
-APP_DIR="${APP_DIR:-$HOME/New-project}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULT_APP_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+APP_DIR="${APP_DIR:-$DEFAULT_APP_DIR}"
 VENV_DIR="${VENV_DIR:-$HOME/venvs/omnivoice-api}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8001}"
