@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import time
 import uuid
+from collections import OrderedDict
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,6 +55,7 @@ CHUNK_SIZE_CHARS = max(1, int(os.getenv("OMNIVOICE_CHUNK_SIZE_CHARS", "200")))
 BATCH_SIZE = max(1, int(os.getenv("OMNIVOICE_BATCH_SIZE", "12")))
 BATCH_MAX_WAIT_MS = max(0.0, float(os.getenv("OMNIVOICE_BATCH_MAX_WAIT_MS", "100")))
 BUSY_BACKLOG_CHUNKS = max(1, int(os.getenv("OMNIVOICE_BUSY_BACKLOG_CHUNKS", str(BATCH_SIZE * 2))))
+PROMPT_CACHE_SIZE = max(1, int(os.getenv("OMNIVOICE_PROMPT_CACHE_SIZE", "64")))
 JOB_CLEANUP_INTERVAL_SECONDS = 60
 
 SUPPORTED_FORMATS = {"wav", "mp3"}
@@ -87,6 +89,9 @@ cache_locks: dict[str, asyncio.Lock] = {}
 cache_locks_guard = asyncio.Lock()
 tts_jobs: dict[str, "TTSJob"] = {}
 tts_jobs_lock = asyncio.Lock()
+voice_prompt_cache: OrderedDict[str, object] = OrderedDict()
+voice_prompt_cache_locks: dict[str, asyncio.Lock] = {}
+voice_prompt_cache_guard = asyncio.Lock()
 
 
 class TTSRequest(BaseModel):
@@ -255,6 +260,58 @@ async def _get_cache_lock(key: str) -> asyncio.Lock:
             lock = asyncio.Lock()
             cache_locks[key] = lock
         return lock
+
+
+def _voice_prompt_cache_key(req: TTSRequest, ref: ReferenceCacheEntry) -> str:
+    transcript = (ref.transcript or "").strip()
+    return _sha256(
+        json.dumps(
+            {
+                "model": MODEL_NAME,
+                "acceleration": ACCELERATION,
+                "audio_path": str(ref.audio_path),
+                "transcript": transcript,
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+    )
+
+
+async def _get_voice_prompt_cache_lock(key: str) -> asyncio.Lock:
+    async with voice_prompt_cache_guard:
+        lock = voice_prompt_cache_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            voice_prompt_cache_locks[key] = lock
+        return lock
+
+
+async def _get_voice_clone_prompt(req: TTSRequest, ref: ReferenceCacheEntry) -> object:
+    cache_key = _voice_prompt_cache_key(req, ref)
+    async with voice_prompt_cache_guard:
+        cached = voice_prompt_cache.get(cache_key)
+        if cached is not None:
+            voice_prompt_cache.move_to_end(cache_key)
+            return cached
+
+    cache_lock = await _get_voice_prompt_cache_lock(cache_key)
+    async with cache_lock:
+        async with voice_prompt_cache_guard:
+            cached = voice_prompt_cache.get(cache_key)
+            if cached is not None:
+                voice_prompt_cache.move_to_end(cache_key)
+                return cached
+
+        async with gpu_generation_semaphore:
+            prompt = await asyncio.to_thread(_create_voice_clone_prompt, req, ref)
+
+        async with voice_prompt_cache_guard:
+            voice_prompt_cache[cache_key] = prompt
+            voice_prompt_cache.move_to_end(cache_key)
+            while len(voice_prompt_cache) > PROMPT_CACHE_SIZE:
+                voice_prompt_cache.popitem(last=False)
+        return prompt
 
 
 async def _download_ref_audio(ref_audio_url: str, target: Path) -> None:
@@ -569,6 +626,8 @@ async def _get_runtime_metrics() -> dict[str, object]:
             "batch_size": BATCH_SIZE,
             "batch_max_wait_ms": BATCH_MAX_WAIT_MS,
             "busy_backlog_chunks": BUSY_BACKLOG_CHUNKS,
+            "voice_clone_prompt_cache_size": len(voice_prompt_cache),
+            "voice_clone_prompt_cache_max_size": PROMPT_CACHE_SIZE,
             "tts_jobs": job_counts,
         }
 
@@ -760,7 +819,7 @@ async def _generate_chunked_response_audio(
     if SKIP_MODEL_LOAD:
         voice_clone_prompt = None
     else:
-        voice_clone_prompt = await asyncio.to_thread(_create_voice_clone_prompt, req, ref)
+        voice_clone_prompt = await _get_voice_clone_prompt(req, ref)
         transcript = (voice_clone_prompt.ref_text or "").strip()
 
     futures: list[asyncio.Future[str]] = []
