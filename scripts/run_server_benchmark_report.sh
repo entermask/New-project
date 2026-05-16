@@ -148,6 +148,18 @@ if [[ -z "$PYTHON_BIN" ]]; then
   fi
 fi
 
+BENCHMARK_HELP="$("$PYTHON_BIN" "$BENCHMARK" --help 2>&1)" || {
+  echo "Could not run $BENCHMARK --help with $PYTHON_BIN:" >&2
+  printf '%s\n' "$BENCHMARK_HELP" >&2
+  exit 1
+}
+for required_option in --ref-audio-url --ref-audio-variants --ref-audio-variant-param --ref-audio-selection; do
+  if ! grep -q -- "$required_option" <<< "$BENCHMARK_HELP"; then
+    echo "$BENCHMARK does not support $required_option. Copy the updated scripts/benchmark_tts.py before running the matrix." >&2
+    exit 1
+  fi
+done
+
 if [[ -z "${API_TOKEN:-}" && -f "$ENV_FILE" ]]; then
   API_TOKEN="$(
     "$PYTHON_BIN" - "$ENV_FILE" <<'PY'
@@ -350,6 +362,54 @@ print(
 PY
 }
 
+write_failed_result_json() {
+  local result_json="$1"
+  local case_log="$2"
+  local rc="$3"
+
+  if [[ -s "$result_json" ]]; then
+    return
+  fi
+
+  "$PYTHON_BIN" - "$result_json" "$case_log" "$rc" "$REQUESTS" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+result_json, case_log, rc, requests = sys.argv[1:5]
+log_path = Path(case_log)
+log_text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
+log_tail = "\n".join(log_text.splitlines()[-80:])
+requests_int = int(requests)
+payload = {
+    "summary": {
+        "requests": requests_int,
+        "ok": 0,
+        "failed": requests_int,
+        "total_elapsed_s": 0,
+        "requests_per_s": 0,
+        "bytes_downloaded": 0,
+        "avg_ms": 0,
+        "min_ms": 0,
+        "p50_ms": 0,
+        "p90_ms": 0,
+        "p95_ms": 0,
+        "p99_ms": 0,
+        "max_ms": 0,
+        "cache_hits": 0,
+        "cache_misses": 0,
+    },
+    "error": {
+        "return_code": int(rc),
+        "log_path": str(log_path),
+        "log_tail": log_tail,
+    },
+    "results": [],
+}
+Path(result_json).write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+PY
+}
+
 {
   echo "# OmniVoice TTS Benchmark Report"
   echo
@@ -478,6 +538,7 @@ for model_id in "${MODELS[@]}"; do
           if (( rc != 0 )); then
             status="benchmark_failed_rc_${rc}"
             FAILED_CASES=$((FAILED_CASES + 1))
+            write_failed_result_json "$result_json" "$case_log" "$rc"
           fi
 
           curl -fsS "$BASE_URL/health" -o "$after_health" >/dev/null 2>&1 || true

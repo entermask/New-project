@@ -3,12 +3,17 @@ import argparse
 import asyncio
 import csv
 import json
+import math
 import statistics
 import time
 from dataclasses import asdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl
+from urllib.parse import urlencode
+from urllib.parse import urlsplit
+from urllib.parse import urlunsplit
 
 import httpx
 
@@ -16,6 +21,9 @@ import httpx
 @dataclass
 class Result:
     index: int
+    text_index: int
+    ref_audio_index: int
+    ref_audio_url: str
     status_code: int
     ok: bool
     elapsed_ms: float
@@ -45,6 +53,8 @@ def summarize(results: list[Result], total_elapsed: float) -> dict[str, Any]:
         "total_elapsed_s": round(total_elapsed, 3),
         "requests_per_s": round(len(ok_results) / total_elapsed, 3) if total_elapsed else 0,
         "bytes_downloaded": total_bytes,
+        "text_count": len({result.text_index for result in results}),
+        "ref_audio_count": len({result.ref_audio_url for result in results}),
         "avg_ms": round(statistics.mean(latencies), 2) if latencies else 0,
         "min_ms": round(min(latencies), 2) if latencies else 0,
         "p50_ms": round(percentile(latencies, 50), 2),
@@ -55,6 +65,42 @@ def summarize(results: list[Result], total_elapsed: float) -> dict[str, Any]:
         "cache_hits": sum(1 for result in ok_results if result.cache_hit == "true"),
         "cache_misses": sum(1 for result in ok_results if result.cache_hit == "false"),
     }
+
+
+def summarize_subset(results: list[Result]) -> dict[str, Any]:
+    ok_results = [result for result in results if result.ok]
+    latencies = [result.elapsed_ms for result in ok_results]
+    return {
+        "requests": len(results),
+        "ok": len(ok_results),
+        "failed": len(results) - len(ok_results),
+        "avg_ms": round(statistics.mean(latencies), 2) if latencies else 0,
+        "min_ms": round(min(latencies), 2) if latencies else 0,
+        "p50_ms": round(percentile(latencies, 50), 2),
+        "p90_ms": round(percentile(latencies, 90), 2),
+        "p95_ms": round(percentile(latencies, 95), 2),
+        "p99_ms": round(percentile(latencies, 99), 2),
+        "max_ms": round(max(latencies), 2) if latencies else 0,
+        "cache_hits": sum(1 for result in ok_results if result.cache_hit == "true"),
+        "cache_misses": sum(1 for result in ok_results if result.cache_hit == "false"),
+    }
+
+
+def summarize_by_ref_audio(results: list[Result]) -> list[dict[str, Any]]:
+    groups: dict[int, list[Result]] = {}
+    for result in results:
+        groups.setdefault(result.ref_audio_index, []).append(result)
+    summaries = []
+    for ref_audio_index in sorted(groups):
+        group = groups[ref_audio_index]
+        summaries.append(
+            {
+                "ref_audio_index": ref_audio_index,
+                "ref_audio_url": group[0].ref_audio_url,
+                "summary": summarize_subset(group),
+            }
+        )
+    return summaries
 
 
 def load_texts(args: argparse.Namespace) -> list[str]:
@@ -70,10 +116,53 @@ def load_texts(args: argparse.Namespace) -> list[str]:
     return [args.text]
 
 
+def set_query_param(url: str, name: str, value: int) -> str:
+    parts = urlsplit(url)
+    query = [(key, val) for key, val in parse_qsl(parts.query, keep_blank_values=True) if key != name]
+    query.append((name, str(value)))
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
+def load_ref_audio_urls(args: argparse.Namespace) -> list[str]:
+    base_urls = list(args.ref_audio_url or [])
+    if args.ref_audio_url_file:
+        base_urls.extend(
+            line.strip()
+            for line in Path(args.ref_audio_url_file).read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+    if not base_urls:
+        raise SystemExit("At least one --ref-audio-url or --ref-audio-url-file entry is required")
+    if args.ref_audio_variants < 1:
+        raise SystemExit("--ref-audio-variants must be >= 1")
+
+    urls = []
+    for base_url in base_urls:
+        if args.ref_audio_variants == 1:
+            urls.append(base_url)
+            continue
+        for offset in range(args.ref_audio_variants):
+            value = args.ref_audio_variant_start + offset
+            urls.append(set_query_param(base_url, args.ref_audio_variant_param, value))
+    return urls
+
+
+def select_ref_audio_index(index: int, total_requests: int, ref_audio_count: int, strategy: str) -> int:
+    if strategy == "round-robin":
+        return index % ref_audio_count
+    if strategy == "grouped":
+        group_size = max(1, math.ceil(total_requests / ref_audio_count))
+        return min(ref_audio_count - 1, index // group_size)
+    raise ValueError(f"Unsupported ref audio selection strategy: {strategy}")
+
+
 async def run_one(
     client: httpx.AsyncClient,
     semaphore: asyncio.Semaphore,
     index: int,
+    text_index: int,
+    ref_audio_index: int,
+    ref_audio_url: str,
     url: str,
     base_url: str,
     token: str,
@@ -105,6 +194,9 @@ async def run_one(
                     body = response.content
                     return Result(
                         index=index,
+                        text_index=text_index,
+                        ref_audio_index=ref_audio_index,
+                        ref_audio_url=ref_audio_url,
                         status_code=response.status_code,
                         ok=False,
                         elapsed_ms=elapsed_ms,
@@ -126,6 +218,9 @@ async def run_one(
                         elapsed_ms = (time.perf_counter() - started) * 1000
                         return Result(
                             index=index,
+                            text_index=text_index,
+                            ref_audio_index=ref_audio_index,
+                            ref_audio_url=ref_audio_url,
                             status_code=0,
                             ok=False,
                             elapsed_ms=elapsed_ms,
@@ -149,6 +244,9 @@ async def run_one(
                         elapsed_ms = (time.perf_counter() - started) * 1000
                         return Result(
                             index=index,
+                            text_index=text_index,
+                            ref_audio_index=ref_audio_index,
+                            ref_audio_url=ref_audio_url,
                             status_code=500,
                             ok=False,
                             elapsed_ms=elapsed_ms,
@@ -172,6 +270,9 @@ async def run_one(
                 (output_dir / f"{index:05d}.{suffix}").write_bytes(body)
             return Result(
                 index=index,
+                text_index=text_index,
+                ref_audio_index=ref_audio_index,
+                ref_audio_url=ref_audio_url,
                 status_code=response.status_code,
                 ok=ok,
                 elapsed_ms=elapsed_ms,
@@ -185,6 +286,9 @@ async def run_one(
             elapsed_ms = (time.perf_counter() - started) * 1000
             return Result(
                 index=index,
+                text_index=text_index,
+                ref_audio_index=ref_audio_index,
+                ref_audio_url=ref_audio_url,
                 status_code=0,
                 ok=False,
                 elapsed_ms=elapsed_ms,
@@ -197,7 +301,10 @@ async def run_one(
 
 
 async def run(args: argparse.Namespace) -> int:
+    if args.requests < 1:
+        raise SystemExit("--requests must be >= 1")
     texts = load_texts(args)
+    ref_audio_urls = load_ref_audio_urls(args)
     base_url = args.base_url.rstrip("/")
     url = base_url + ("/v1/tts/sync" if args.mode == "sync" else "/v1/tts")
     semaphore = asyncio.Semaphore(args.concurrency)
@@ -207,10 +314,18 @@ async def run(args: argparse.Namespace) -> int:
 
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
         for index in range(args.requests):
-            text = texts[index % len(texts)]
+            text_index = index % len(texts)
+            ref_audio_index = select_ref_audio_index(
+                index,
+                args.requests,
+                len(ref_audio_urls),
+                args.ref_audio_selection,
+            )
+            text = texts[text_index]
+            ref_audio_url = ref_audio_urls[ref_audio_index]
             payload = {
                 "text": text,
-                "ref_audio_url": args.ref_audio_url,
+                "ref_audio_url": ref_audio_url,
                 "num_step": args.num_step,
                 "format": args.format,
             }
@@ -225,6 +340,9 @@ async def run(args: argparse.Namespace) -> int:
                     client=client,
                     semaphore=semaphore,
                     index=index,
+                    text_index=text_index,
+                    ref_audio_index=ref_audio_index,
+                    ref_audio_url=ref_audio_url,
                     url=url,
                     base_url=base_url,
                     token=args.token,
@@ -248,6 +366,18 @@ async def run(args: argparse.Namespace) -> int:
             json.dumps(
                 {
                     "summary": summary,
+                    "metadata": {
+                        "base_url": base_url,
+                        "mode": args.mode,
+                        "format": args.format,
+                        "num_step": args.num_step,
+                        "speed": args.speed,
+                        "language": args.language,
+                        "text_count": len(texts),
+                        "ref_audio_selection": args.ref_audio_selection,
+                        "ref_audio_urls": ref_audio_urls,
+                    },
+                    "ref_audio_summaries": summarize_by_ref_audio(results),
                     "results": [asdict(result) for result in results],
                 },
                 indent=2,
@@ -272,7 +402,36 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark the OmniVoice /v1/tts API.")
     parser.add_argument("--base-url", required=True, help="Base API URL, e.g. https://id-8001.thundercompute.net")
     parser.add_argument("--token", required=True, help="Bearer API token")
-    parser.add_argument("--ref-audio-url", required=True, help="Reference audio URL")
+    parser.add_argument(
+        "--ref-audio-url",
+        action="append",
+        default=[],
+        help="Reference audio URL. May be repeated.",
+    )
+    parser.add_argument("--ref-audio-url-file", default="", help="Optional file with one reference audio URL per line")
+    parser.add_argument(
+        "--ref-audio-variants",
+        type=int,
+        default=1,
+        help="Create N cache-distinct variants per reference URL by setting a query parameter",
+    )
+    parser.add_argument(
+        "--ref-audio-variant-param",
+        default="a",
+        help="Query parameter name used by --ref-audio-variants, e.g. a creates .mp3?a=1",
+    )
+    parser.add_argument(
+        "--ref-audio-variant-start",
+        type=int,
+        default=1,
+        help="First query parameter value for --ref-audio-variants",
+    )
+    parser.add_argument(
+        "--ref-audio-selection",
+        choices=["round-robin", "grouped"],
+        default="round-robin",
+        help="How requests are assigned to multiple reference audio URLs",
+    )
     parser.add_argument("--ref-text", default="", help="Optional reference transcript")
     parser.add_argument("--text", default="Xin chào, đây là benchmark OmniVoice.", help="Text for all requests")
     parser.add_argument("--text-file", default="", help="Optional file with one text per line")
