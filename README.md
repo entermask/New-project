@@ -6,7 +6,7 @@ Standalone FastAPI wrapper for [OmniVoice](https://github.com/k2-fsa/OmniVoice),
 
 ### `GET /health`
 
-Returns model, GPU, concurrency, and cache status.
+Returns model, GPU, chunk scheduler, and cache status.
 
 ```json
 {
@@ -18,24 +18,19 @@ Returns model, GPU, concurrency, and cache status.
   "dtype": "fp16",
   "cache_audio_count": 12,
   "cache_transcript_count": 12,
-  "active_requests": 3,
-  "active_generations": 1,
+  "active_requests": 0,
+  "active_generations": 12,
   "active_generation_batches": 1,
-  "queued_generations": 2,
-  "max_concurrency": 4,
-  "generation_capacity": 4,
-  "available_generation_slots": 3,
-  "batching_enabled": true,
-  "batch_size": 4,
-  "batch_max_wait_ms": 100.0,
-  "batch_queue_size": 256,
-  "voice_clone_prompt_cache_enabled": true,
-  "voice_clone_prompt_cache_size": 8,
-  "voice_clone_prompt_cache_max_size": 64,
-  "voice_clone_prompt_cache_ttl_seconds": 3600,
-  "voice_clone_prompt_cache_hits": 120,
-  "voice_clone_prompt_cache_misses": 8,
-  "voice_clone_prompt_cache_evictions": 0,
+  "queued_generations": 12,
+  "queued_chunks": 12,
+  "running_chunks": 12,
+  "outstanding_chunks": 24,
+  "deferred_chunks": 0,
+  "active_tts_jobs": 2,
+  "chunk_size_chars": 200,
+  "batch_size": 12,
+  "batch_max_wait_ms": 50.0,
+  "busy_backlog_chunks": 24,
   "tts_jobs": {
     "queued": 2,
     "running": 1,
@@ -91,7 +86,11 @@ Response:
   "status": "queued",
   "created_at": 1778730000.0,
   "updated_at": 1778730000.0,
-  "status_url": "/v1/tts/jobs/f5a4e..."
+  "status_url": "/v1/tts/jobs/f5a4e...",
+  "input_chars": 840,
+  "chunks_total": 5,
+  "chunks_completed": 0,
+  "chunks_failed": 0
 }
 ```
 
@@ -109,7 +108,10 @@ When the job succeeds, the status response includes:
   "audio_url": "/v1/tts/jobs/<request_id>/audio",
   "format": "mp3",
   "cache_hit": true,
-  "transcript": "Reference transcript"
+  "transcript": "Reference transcript",
+  "chunks_total": 5,
+  "chunks_completed": 5,
+  "chunks_failed": 0
 }
 ```
 
@@ -128,8 +130,6 @@ X-Cache-Hit: true|false
 X-Transcript: <url-encoded-transcript>
 X-Transcript-Encoding: urlencoded-utf8
 ```
-
-For direct audio responses during benchmarking, use `POST /v1/tts/sync`.
 
 Completed job metadata and audio files are kept for `OMNIVOICE_JOB_TTL_SECONDS`, default `3600`.
 
@@ -159,34 +159,25 @@ tmp/
 
 If `ref_text` is provided, it is used and written to transcript cache. If `ref_text` is missing, the server reuses a cached transcript when present. Otherwise, OmniVoice auto-transcribes the reference audio with Whisper during prompt creation and the resolved transcript is cached afterward.
 
-The service also keeps an in-memory LRU cache of OmniVoice `voice_clone_prompt` objects. This does not change the request payload: clients still send `ref_audio_url` and optional `ref_text`. The cache key is based on model, acceleration mode, cached reference audio path, and resolved reference transcript.
+## Chunked TTS Scheduler
+
+`/v1/tts` is the only public TTS endpoint. Every request becomes one logical TTS job. The server splits the input text into small chunks, creates one `voice_clone_prompt` for the job, generates chunk audio in GPU batches, then merges chunks into the final audio file.
 
 ```text
-OMNIVOICE_ENABLE_PROMPT_CACHE=1
-OMNIVOICE_PROMPT_CACHE_SIZE=64
-OMNIVOICE_PROMPT_CACHE_TTL_SECONDS=3600
-```
-
-This cache is per process. If multiple instances are running, each instance warms its own prompt cache unless traffic is routed consistently to the same instance.
-
-## Micro-Batching
-
-`/v1/tts` uses a small server-side generation queue by default. Requests still get individual audio responses, but the GPU generation step is grouped into short batches before calling OmniVoice.
-
-```text
-OMNIVOICE_ENABLE_BATCHING=1
-OMNIVOICE_BATCH_SIZE=4
-OMNIVOICE_BATCH_MAX_WAIT_MS=100
-OMNIVOICE_BATCH_QUEUE_SIZE=256
-OMNIVOICE_MAX_INFLIGHT_JOBS=20
+OMNIVOICE_CHUNK_SIZE_CHARS=200
+OMNIVOICE_BATCH_SIZE=12
+OMNIVOICE_BUSY_BACKLOG_CHUNKS=24
+OMNIVOICE_BATCH_MAX_WAIT_MS=50
 OMNIVOICE_JOB_TTL_SECONDS=3600
 ```
 
-`OMNIVOICE_BATCH_SIZE` defaults to `OMNIVOICE_CONCURRENCY`. Start with `4` or `6` on A100, then test `8` and `12`. On H100, start at `8` or `12`, then test `16`, `24`, and `32`. Increase `OMNIVOICE_BATCH_MAX_WAIT_MS` only if traffic is sparse and batches are not filling; lower it if first-token latency matters more than throughput.
+`OMNIVOICE_CHUNK_SIZE_CHARS` is a target, not a hard split point. The splitter prefers sentence and punctuation boundaries, then whitespace, then a hard cut for very long spans.
 
-Batching groups compatible requests by `num_step`, `speed`, and `language`.
+`OMNIVOICE_BATCH_SIZE` is the maximum number of chunks sent to one `model.generate(...)` call. Compatible chunks are grouped by `num_step`, `speed`, and `language`.
 
-`OMNIVOICE_MAX_INFLIGHT_JOBS` limits async `/v1/tts` queued/running jobs. When the limit is reached, new submissions return `429 Too Many Requests` with `Retry-After: 1`.
+`OMNIVOICE_BUSY_BACKLOG_CHUNKS` is the admission gate. New requests are accepted while queued+running chunks are below this value. Once the backlog reaches the limit, new submissions return `429 Too Many Requests` with `Retry-After: 1`. Accepted jobs are not rejected internally; they run to `succeeded` or `failed`.
+
+`OMNIVOICE_BATCH_MAX_WAIT_MS` is only a short wait to let a partial batch fill with nearby traffic. It is not a public request queue.
 
 ## Acceleration
 
@@ -220,7 +211,7 @@ triton
 hybrid
 ```
 
-`base` is the official OmniVoice path and is the default. `triton` uses `omnivoice-triton` kernel fusion without CUDA Graph capture, so it is the safer optimized mode to test with batching/concurrency. `hybrid` uses CUDA Graph + Triton and should stay experimental because concurrent graph capture can fail; start `hybrid` with concurrency `1`.
+`base` is the official OmniVoice path and is the default. `triton` uses `omnivoice-triton` kernel fusion without CUDA Graph capture, so it is the safer optimized mode to test with chunk batching. `hybrid` uses CUDA Graph + Triton and should stay experimental; start with a small `OMNIVOICE_BATCH_SIZE`.
 
 Recommended testing order:
 
@@ -458,9 +449,23 @@ python scripts/benchmark_tts.py \
   --concurrency 4 \
   --speed 1.1 \
   --format mp3 \
-  --mode poll \
   --results-json benchmark.json \
   --results-csv benchmark.csv
+```
+
+Use `--text-repeat` to create a long logical TTS job without creating a separate text file:
+
+```bash
+python scripts/benchmark_tts.py \
+  --base-url "$BASE_URL" \
+  --token "$API_TOKEN" \
+  --ref-audio-url "$REF_AUDIO_URL" \
+  --text "Day la cau benchmark cho long-form TTS." \
+  --text-repeat 80 \
+  --requests 1 \
+  --concurrency 1 \
+  --format mp3 \
+  --results-json benchmark-long.json
 ```
 
 To benchmark cold/warm behavior across many reference-audio cache keys while downloading the same source object, create query-string variants:
@@ -475,22 +480,21 @@ python scripts/benchmark_tts.py \
   --ref-audio-selection round-robin \
   --requests 40 \
   --concurrency 8 \
-  --format mp3 \
-  --mode poll
+  --format mp3
 ```
 
 This sends `ref.mp3?a=1`, `ref.mp3?a=2`, ... `ref.mp3?a=8`. Use `--ref-audio-selection grouped` if you want each variant to receive a contiguous block of requests instead of round-robin traffic.
 
-Benchmark results include audio duration and RTF (`elapsed_ms / audio_duration_ms`) when `ffprobe` is available. Install `ffmpeg` on the benchmark client for MP3 duration probing.
+Benchmark results include submit latency, end-to-end latency, status counts, accepted/rejected counts, chunk progress, audio duration, and RTF (`end_to_end_ms / audio_duration_ms`) when `ffprobe` is available. Install `ffmpeg` on the benchmark client for MP3 duration probing.
 
 Compare WAV and MP3 with the same payload:
 
 ```bash
-python scripts/benchmark_tts.py --base-url "$BASE_URL" --token "$API_TOKEN" --ref-audio-url "$REF_AUDIO_URL" --requests 20 --concurrency 4 --format wav --mode poll
-python scripts/benchmark_tts.py --base-url "$BASE_URL" --token "$API_TOKEN" --ref-audio-url "$REF_AUDIO_URL" --requests 20 --concurrency 4 --format mp3 --mode poll
+python scripts/benchmark_tts.py --base-url "$BASE_URL" --token "$API_TOKEN" --ref-audio-url "$REF_AUDIO_URL" --requests 20 --concurrency 4 --format wav
+python scripts/benchmark_tts.py --base-url "$BASE_URL" --token "$API_TOKEN" --ref-audio-url "$REF_AUDIO_URL" --requests 20 --concurrency 4 --format mp3
 ```
 
-The server-side matrix defaults to `base` acceleration. Set `MATRIX_ACCELERATIONS="base triton"` only when you explicitly want to compare Triton. For `hybrid`, start with `OMNIVOICE_CONCURRENCY=1` and benchmark `--concurrency 1`; only increase it if CUDA Graph capture stays stable.
+The server-side matrix defaults to `base` acceleration. Set `MATRIX_ACCELERATIONS="base triton"` only when you explicitly want to compare Triton. The matrix value named `MATRIX_CONCURRENCIES` is kept for compatibility with old reports; it now sets both benchmark client concurrency and `OMNIVOICE_BATCH_SIZE`.
 
 Run the server-side matrix benchmark when comparing A100 and H100:
 
@@ -504,7 +508,7 @@ MATRIX_REF_AUDIO_VARIANTS="1 8 requests" REF_AUDIO_VARIANT_PARAM=a ./scripts/run
 # Force the A100 matrix.
 GPU_PROFILE=a100 ./scripts/run_server_benchmark_report.sh
 
-# Force the H100 matrix: larger batch/concurrency and fp16+bf16 dtype tests.
+# Force the H100 matrix with larger chunk batches.
 GPU_PROFILE=h100 ./scripts/run_server_benchmark_report.sh
 
 # Compare official and BF16-converted checkpoints.
@@ -515,7 +519,7 @@ H100 defaults are:
 
 ```text
 MATRIX_CONCURRENCIES="8 12 16 24 32"
-MATRIX_DTYPES="fp16 bf16"
+MATRIX_DTYPES="fp16"
 MATRIX_STEPS="16 32"
 OMNIVOICE_BATCH_MAX_WAIT_MS=50
 ```
@@ -530,7 +534,7 @@ A100 defaults are:
 
 ```text
 MATRIX_CONCURRENCIES="4 6 8 12"
-MATRIX_DTYPES="fp16 bf16"
+MATRIX_DTYPES="fp16"
 MATRIX_STEPS="16 32"
 OMNIVOICE_BATCH_MAX_WAIT_MS=100
 ```

@@ -28,7 +28,7 @@ Common overrides:
 Matrix overrides, space-separated:
   MATRIX_MODELS                Default: k2-fsa/OmniVoice
   MATRIX_ACCELERATIONS         Default: base
-  MATRIX_CONCURRENCIES         A100 default: 4 6 8 12; H100 default: 8 12 16 24 32
+  MATRIX_CONCURRENCIES         A100 default: 4 6 8 12; H100 default: 8 12 16 24 32. Also sets OMNIVOICE_BATCH_SIZE.
   MATRIX_DTYPES                A100/H100 default: fp16 bf16
   MATRIX_STEPS                 Default: 16 32
   MATRIX_SPEEDS                Default: 1.0 1.1
@@ -223,36 +223,24 @@ write_case_env() {
   local concurrency="$2"
   local dtype="$3"
   local model_id="$4"
-  local max_inflight="${OMNIVOICE_MAX_INFLIGHT_JOBS:-}"
-  local queue_size="${OMNIVOICE_BATCH_QUEUE_SIZE:-}"
+  local busy_backlog_chunks="${OMNIVOICE_BUSY_BACKLOG_CHUNKS:-}"
   local batch_wait_ms="${OMNIVOICE_BATCH_MAX_WAIT_MS:-$DEFAULT_BATCH_MAX_WAIT_MS}"
 
-  if [[ -z "$max_inflight" ]]; then
-    max_inflight=$(( concurrency * 2 ))
-    if (( max_inflight < REQUESTS )); then
-      max_inflight="$REQUESTS"
-    fi
-  fi
-  if [[ -z "$queue_size" ]]; then
-    queue_size=$(( concurrency * 16 ))
-    if (( queue_size < 256 )); then
-      queue_size=256
-    fi
+  if [[ -z "$busy_backlog_chunks" ]]; then
+    busy_backlog_chunks=$(( concurrency * 2 ))
   fi
 
-  grep -Ev '^(OMNIVOICE_MODEL|OMNIVOICE_ACCELERATION|OMNIVOICE_CONCURRENCY|OMNIVOICE_BATCH_SIZE|OMNIVOICE_BATCH_MAX_WAIT_MS|OMNIVOICE_BATCH_QUEUE_SIZE|OMNIVOICE_MAX_INFLIGHT_JOBS|OMNIVOICE_ENABLE_BATCHING|OMNIVOICE_SKIP_MODEL_LOAD|OMNIVOICE_GPU_PROFILE|OMNIVOICE_DTYPE|API_TOKEN)=' "$ENV_BACKUP" > "$ENV_FILE" || true
+  grep -Ev '^(OMNIVOICE_MODEL|OMNIVOICE_ACCELERATION|OMNIVOICE_CONCURRENCY|OMNIVOICE_BATCH_SIZE|OMNIVOICE_BATCH_MAX_WAIT_MS|OMNIVOICE_BATCH_QUEUE_SIZE|OMNIVOICE_MAX_INFLIGHT_JOBS|OMNIVOICE_ENABLE_BATCHING|OMNIVOICE_CHUNK_SIZE_CHARS|OMNIVOICE_BUSY_BACKLOG_CHUNKS|OMNIVOICE_SKIP_MODEL_LOAD|OMNIVOICE_GPU_PROFILE|OMNIVOICE_DTYPE|API_TOKEN)=' "$ENV_BACKUP" > "$ENV_FILE" || true
   {
     printf 'API_TOKEN=%q\n' "$API_TOKEN"
     printf 'OMNIVOICE_MODEL=%q\n' "$model_id"
     printf 'OMNIVOICE_GPU_PROFILE=%q\n' "$PROFILE_FOR_MATRIX"
     printf 'OMNIVOICE_DTYPE=%q\n' "$dtype"
     printf 'OMNIVOICE_ACCELERATION=%q\n' "$acceleration"
-    printf 'OMNIVOICE_CONCURRENCY=%q\n' "$concurrency"
+    printf 'OMNIVOICE_CHUNK_SIZE_CHARS=%q\n' "${OMNIVOICE_CHUNK_SIZE_CHARS:-200}"
     printf 'OMNIVOICE_BATCH_SIZE=%q\n' "$concurrency"
     printf 'OMNIVOICE_BATCH_MAX_WAIT_MS=%q\n' "$batch_wait_ms"
-    printf 'OMNIVOICE_BATCH_QUEUE_SIZE=%q\n' "$queue_size"
-    printf 'OMNIVOICE_MAX_INFLIGHT_JOBS=%q\n' "$max_inflight"
-    printf 'OMNIVOICE_ENABLE_BATCHING=1\n'
+    printf 'OMNIVOICE_BUSY_BACKLOG_CHUNKS=%q\n' "$busy_backlog_chunks"
     printf 'OMNIVOICE_SKIP_MODEL_LOAD=0\n'
   } >> "$ENV_FILE"
 }
@@ -282,7 +270,6 @@ ok = (
     data.get("status") == "ok"
     and data.get("model_loaded") is True
     and data.get("acceleration") == expected_acceleration
-    and str(data.get("max_concurrency")) == expected_concurrency
     and str(data.get("batch_size")) == expected_batch
     and data.get("dtype") == expected_dtype
     and data.get("gpu_profile") == expected_profile
@@ -536,7 +523,7 @@ for model_id in "${MODELS[@]}"; do
                 echo "Health check timed out for $case_id" | tee "$case_log"
                 status="health_timeout"
                 FAILED_CASES=$((FAILED_CASES + 1))
-                append_case_row "$case_id" "$PROFILE_FOR_MATRIX" "$model_id" "$dtype" "$acceleration" "$concurrency" "$resolved_ref_variants" "$step" "$speed" "$result_json" "$status"
+                append_case_row "$case_id" "$PROFILE_FOR_MATRIX" "$model_id" "$dtype" "$acceleration" "$concurrency" "$resolved_ref_variants" "$step" "$speed" "$result_json" "$status" "$before_health" "$after_health"
                 continue
               fi
 
@@ -582,7 +569,7 @@ for model_id in "${MODELS[@]}"; do
               fi
 
               curl -fsS "$BASE_URL/health" -o "$after_health" >/dev/null 2>&1 || true
-              append_case_row "$case_id" "$PROFILE_FOR_MATRIX" "$model_id" "$dtype" "$acceleration" "$concurrency" "$resolved_ref_variants" "$step" "$speed" "$result_json" "$status"
+              append_case_row "$case_id" "$PROFILE_FOR_MATRIX" "$model_id" "$dtype" "$acceleration" "$concurrency" "$resolved_ref_variants" "$step" "$speed" "$result_json" "$status" "$before_health" "$after_health"
             done
           done
         done

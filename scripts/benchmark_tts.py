@@ -28,6 +28,8 @@ class Result:
     ref_audio_url: str
     status_code: int
     ok: bool
+    submit_ms: float
+    end_to_end_ms: float
     elapsed_ms: float
     audio_duration_ms: float
     rtf: float
@@ -35,6 +37,9 @@ class Result:
     cache_hit: str
     request_id: str
     transcript: str
+    chunks_total: int
+    chunks_completed: int
+    chunks_failed: int
     error: str
 
 
@@ -48,14 +53,21 @@ def percentile(values: list[float], pct: float) -> float:
 
 def summarize(results: list[Result], total_elapsed: float) -> dict[str, Any]:
     ok_results = [result for result in results if result.ok]
-    latencies = [result.elapsed_ms for result in ok_results]
+    latencies = [result.end_to_end_ms for result in ok_results]
+    submit_latencies = [result.submit_ms for result in results if result.submit_ms > 0]
     audio_durations = [result.audio_duration_ms for result in ok_results if result.audio_duration_ms > 0]
     rtfs = [result.rtf for result in ok_results if result.rtf > 0]
     total_bytes = sum(result.size_bytes for result in ok_results)
+    status_counts: dict[str, int] = {}
+    for result in results:
+        status_counts[str(result.status_code)] = status_counts.get(str(result.status_code), 0) + 1
     return {
         "requests": len(results),
         "ok": len(ok_results),
         "failed": len(results) - len(ok_results),
+        "accepted": sum(1 for result in results if result.request_id),
+        "rejected_429": sum(1 for result in results if result.status_code == 429),
+        "status_counts": status_counts,
         "total_elapsed_s": round(total_elapsed, 3),
         "requests_per_s": round(len(ok_results) / total_elapsed, 3) if total_elapsed else 0,
         "bytes_downloaded": total_bytes,
@@ -63,6 +75,11 @@ def summarize(results: list[Result], total_elapsed: float) -> dict[str, Any]:
         "audio_duration_s": round(sum(audio_durations) / 1000, 3) if audio_durations else 0,
         "text_count": len({result.text_index for result in results}),
         "ref_audio_count": len({result.ref_audio_url for result in results}),
+        "avg_submit_ms": round(statistics.mean(submit_latencies), 2) if submit_latencies else 0,
+        "p95_submit_ms": round(percentile(submit_latencies, 95), 2),
+        "chunks_total": sum(result.chunks_total for result in results),
+        "chunks_completed": sum(result.chunks_completed for result in results),
+        "chunks_failed": sum(result.chunks_failed for result in results),
         "avg_ms": round(statistics.mean(latencies), 2) if latencies else 0,
         "min_ms": round(min(latencies), 2) if latencies else 0,
         "p50_ms": round(percentile(latencies, 50), 2),
@@ -84,13 +101,18 @@ def summarize(results: list[Result], total_elapsed: float) -> dict[str, Any]:
 
 def summarize_subset(results: list[Result]) -> dict[str, Any]:
     ok_results = [result for result in results if result.ok]
-    latencies = [result.elapsed_ms for result in ok_results]
+    latencies = [result.end_to_end_ms for result in ok_results]
     audio_durations = [result.audio_duration_ms for result in ok_results if result.audio_duration_ms > 0]
     rtfs = [result.rtf for result in ok_results if result.rtf > 0]
     return {
         "requests": len(results),
         "ok": len(ok_results),
         "failed": len(results) - len(ok_results),
+        "accepted": sum(1 for result in results if result.request_id),
+        "rejected_429": sum(1 for result in results if result.status_code == 429),
+        "chunks_total": sum(result.chunks_total for result in results),
+        "chunks_completed": sum(result.chunks_completed for result in results),
+        "chunks_failed": sum(result.chunks_failed for result in results),
         "avg_ms": round(statistics.mean(latencies), 2) if latencies else 0,
         "min_ms": round(min(latencies), 2) if latencies else 0,
         "p50_ms": round(percentile(latencies, 50), 2),
@@ -134,8 +156,14 @@ def load_texts(args: argparse.Namespace) -> list[str]:
         ]
         if not lines:
             raise SystemExit("--text-file has no non-empty lines")
-        return lines
-    return [args.text]
+        texts = lines
+    else:
+        texts = [args.text]
+    if args.text_repeat < 1:
+        raise SystemExit("--text-repeat must be >= 1")
+    if args.text_repeat > 1:
+        texts = [" ".join([text] * args.text_repeat) for text in texts]
+    return texts
 
 
 def set_query_param(url: str, name: str, value: int) -> str:
@@ -176,6 +204,13 @@ def select_ref_audio_index(index: int, total_requests: int, ref_audio_count: int
         group_size = max(1, math.ceil(total_requests / ref_audio_count))
         return min(ref_audio_count - 1, index // group_size)
     raise ValueError(f"Unsupported ref audio selection strategy: {strategy}")
+
+
+def estimate_chunks(text: str, chunk_size_chars: int) -> int:
+    stripped = text.strip()
+    if not stripped:
+        return 0
+    return max(1, math.ceil(len(stripped) / max(1, chunk_size_chars)))
 
 
 def probe_audio_duration_ms(body: bytes, suffix: str) -> tuple[float, str]:
@@ -248,96 +283,109 @@ async def run_one(
     async with semaphore:
         started = time.perf_counter()
         try:
-            if mode == "sync":
-                response = await client.post(url, headers=headers, json=payload)
+            response = await client.post(url, headers=headers, json=payload)
+            submit_ms = (time.perf_counter() - started) * 1000
+            if response.status_code != 202:
                 elapsed_ms = (time.perf_counter() - started) * 1000
                 body = response.content
-                ok = response.status_code == 200
-                request_id = response.headers.get("x-request-id", "")
-                cache_hit = response.headers.get("x-cache-hit", "")
-                transcript = response.headers.get("x-transcript", "")
-            else:
-                response = await client.post(url, headers=headers, json=payload)
-                if response.status_code != 202:
+                return Result(
+                    index=index,
+                    text_index=text_index,
+                    ref_audio_index=ref_audio_index,
+                    ref_audio_url=ref_audio_url,
+                    status_code=response.status_code,
+                    ok=False,
+                    submit_ms=submit_ms,
+                    end_to_end_ms=elapsed_ms,
+                    elapsed_ms=elapsed_ms,
+                    audio_duration_ms=0,
+                    rtf=0,
+                    size_bytes=len(body),
+                    cache_hit="",
+                    request_id=response.headers.get("x-request-id", ""),
+                    transcript="",
+                    chunks_total=0,
+                    chunks_completed=0,
+                    chunks_failed=0,
+                    error=body[:500].decode("utf-8", errors="replace"),
+                )
+
+            job = response.json()
+            request_id = str(job["request_id"])
+            status_url = base_url + str(job["status_url"])
+            audio_url = ""
+            cache_hit = ""
+            transcript = ""
+            chunks_total = int(job.get("chunks_total") or 0)
+            chunks_completed = int(job.get("chunks_completed") or 0)
+            chunks_failed = int(job.get("chunks_failed") or 0)
+            while True:
+                if time.perf_counter() - started > timeout_seconds:
                     elapsed_ms = (time.perf_counter() - started) * 1000
-                    body = response.content
                     return Result(
                         index=index,
                         text_index=text_index,
                         ref_audio_index=ref_audio_index,
                         ref_audio_url=ref_audio_url,
-                        status_code=response.status_code,
+                        status_code=0,
                         ok=False,
+                        submit_ms=submit_ms,
+                        end_to_end_ms=elapsed_ms,
                         elapsed_ms=elapsed_ms,
                         audio_duration_ms=0,
                         rtf=0,
-                        size_bytes=len(body),
-                        cache_hit="",
-                        request_id=response.headers.get("x-request-id", ""),
-                        transcript="",
-                        error=body[:500].decode("utf-8", errors="replace"),
+                        size_bytes=0,
+                        cache_hit=cache_hit,
+                        request_id=request_id,
+                        transcript=transcript,
+                        chunks_total=chunks_total,
+                        chunks_completed=chunks_completed,
+                        chunks_failed=chunks_failed,
+                        error="Timed out waiting for TTS job to finish",
+                    )
+                await asyncio.sleep(poll_interval)
+                status_response = await client.get(status_url, headers=headers)
+                status_response.raise_for_status()
+                job = status_response.json()
+                chunks_total = int(job.get("chunks_total") or chunks_total)
+                chunks_completed = int(job.get("chunks_completed") or chunks_completed)
+                chunks_failed = int(job.get("chunks_failed") or chunks_failed)
+                if "cache_hit" in job:
+                    cache_hit = str(job["cache_hit"]).lower()
+                if job["status"] == "succeeded":
+                    audio_url = base_url + str(job["audio_url"])
+                    transcript = str(job.get("transcript", ""))
+                    break
+                if job["status"] == "failed":
+                    elapsed_ms = (time.perf_counter() - started) * 1000
+                    return Result(
+                        index=index,
+                        text_index=text_index,
+                        ref_audio_index=ref_audio_index,
+                        ref_audio_url=ref_audio_url,
+                        status_code=500,
+                        ok=False,
+                        submit_ms=submit_ms,
+                        end_to_end_ms=elapsed_ms,
+                        elapsed_ms=elapsed_ms,
+                        audio_duration_ms=0,
+                        rtf=0,
+                        size_bytes=0,
+                        cache_hit=cache_hit,
+                        request_id=request_id,
+                        transcript=transcript,
+                        chunks_total=chunks_total,
+                        chunks_completed=chunks_completed,
+                        chunks_failed=chunks_failed,
+                        error=str(job.get("detail", "TTS job failed")),
                     )
 
-                job = response.json()
-                request_id = str(job["request_id"])
-                status_url = base_url + str(job["status_url"])
-                audio_url = ""
-                cache_hit = ""
-                transcript = ""
-                while True:
-                    if time.perf_counter() - started > timeout_seconds:
-                        elapsed_ms = (time.perf_counter() - started) * 1000
-                        return Result(
-                            index=index,
-                            text_index=text_index,
-                            ref_audio_index=ref_audio_index,
-                            ref_audio_url=ref_audio_url,
-                            status_code=0,
-                            ok=False,
-                            elapsed_ms=elapsed_ms,
-                            audio_duration_ms=0,
-                            rtf=0,
-                            size_bytes=0,
-                            cache_hit=cache_hit,
-                            request_id=request_id,
-                            transcript=transcript,
-                            error="Timed out waiting for TTS job to finish",
-                        )
-                    await asyncio.sleep(poll_interval)
-                    status_response = await client.get(status_url, headers=headers)
-                    status_response.raise_for_status()
-                    job = status_response.json()
-                    if "cache_hit" in job:
-                        cache_hit = str(job["cache_hit"]).lower()
-                    if job["status"] == "succeeded":
-                        audio_url = base_url + str(job["audio_url"])
-                        transcript = str(job.get("transcript", ""))
-                        break
-                    if job["status"] == "failed":
-                        elapsed_ms = (time.perf_counter() - started) * 1000
-                        return Result(
-                            index=index,
-                            text_index=text_index,
-                            ref_audio_index=ref_audio_index,
-                            ref_audio_url=ref_audio_url,
-                            status_code=500,
-                            ok=False,
-                            elapsed_ms=elapsed_ms,
-                            audio_duration_ms=0,
-                            rtf=0,
-                            size_bytes=0,
-                            cache_hit=cache_hit,
-                            request_id=request_id,
-                            transcript=transcript,
-                            error=str(job.get("detail", "TTS job failed")),
-                        )
-
-                response = await client.get(audio_url, headers=headers)
-                elapsed_ms = (time.perf_counter() - started) * 1000
-                body = response.content
-                ok = response.status_code == 200
-                cache_hit = response.headers.get("x-cache-hit", cache_hit)
-                transcript = response.headers.get("x-transcript", transcript)
+            response = await client.get(audio_url, headers=headers)
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            body = response.content
+            ok = response.status_code == 200
+            cache_hit = response.headers.get("x-cache-hit", cache_hit)
+            transcript = response.headers.get("x-transcript", transcript)
 
             audio_duration_ms = 0.0
             rtf = 0.0
@@ -358,6 +406,8 @@ async def run_one(
                 ref_audio_url=ref_audio_url,
                 status_code=response.status_code,
                 ok=ok,
+                submit_ms=submit_ms,
+                end_to_end_ms=elapsed_ms,
                 elapsed_ms=elapsed_ms,
                 audio_duration_ms=audio_duration_ms,
                 rtf=rtf,
@@ -365,6 +415,9 @@ async def run_one(
                 cache_hit=cache_hit,
                 request_id=request_id,
                 transcript=transcript,
+                chunks_total=chunks_total,
+                chunks_completed=chunks_completed,
+                chunks_failed=chunks_failed,
                 error=duration_error if ok and duration_error else ("" if ok else body[:500].decode("utf-8", errors="replace")),
             )
         except Exception as exc:
@@ -376,6 +429,8 @@ async def run_one(
                 ref_audio_url=ref_audio_url,
                 status_code=0,
                 ok=False,
+                submit_ms=0,
+                end_to_end_ms=elapsed_ms,
                 elapsed_ms=elapsed_ms,
                 audio_duration_ms=0,
                 rtf=0,
@@ -383,6 +438,9 @@ async def run_one(
                 cache_hit="",
                 request_id="",
                 transcript="",
+                chunks_total=0,
+                chunks_completed=0,
+                chunks_failed=0,
                 error=repr(exc),
             )
 
@@ -393,7 +451,7 @@ async def run(args: argparse.Namespace) -> int:
     texts = load_texts(args)
     ref_audio_urls = load_ref_audio_urls(args)
     base_url = args.base_url.rstrip("/")
-    url = base_url + ("/v1/tts/sync" if args.mode == "sync" else "/v1/tts")
+    url = base_url + "/v1/tts"
     semaphore = asyncio.Semaphore(args.concurrency)
     timeout = httpx.Timeout(args.timeout)
     output_dir = Path(args.output_dir) if args.output_dir else None
@@ -435,7 +493,7 @@ async def run(args: argparse.Namespace) -> int:
                     token=args.token,
                     payload=payload,
                     output_dir=output_dir,
-                    mode=args.mode,
+                    mode="poll",
                     poll_interval=args.poll_interval,
                     timeout_seconds=args.timeout,
                 )
@@ -455,12 +513,20 @@ async def run(args: argparse.Namespace) -> int:
                     "summary": summary,
                     "metadata": {
                         "base_url": base_url,
-                        "mode": args.mode,
+                        "mode": "poll",
                         "format": args.format,
                         "num_step": args.num_step,
                         "speed": args.speed,
                         "language": args.language,
                         "text_count": len(texts),
+                        "input_chars": [len(text.strip()) for text in texts],
+                        "estimated_chunks": [
+                            estimate_chunks(text, args.chunk_size_chars) for text in texts
+                        ],
+                        "chunk_size_chars": args.chunk_size_chars,
+                        "text_repeat": args.text_repeat,
+                        "concurrency": args.concurrency,
+                        "requests": args.requests,
                         "ref_audio_selection": args.ref_audio_selection,
                         "ref_audio_urls": ref_audio_urls,
                     },
@@ -522,13 +588,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ref-text", default="", help="Optional reference transcript")
     parser.add_argument("--text", default="Xin chào, đây là benchmark OmniVoice.", help="Text for all requests")
     parser.add_argument("--text-file", default="", help="Optional file with one text per line")
+    parser.add_argument("--text-repeat", type=int, default=1, help="Repeat each text N times to benchmark long TTS jobs")
+    parser.add_argument("--chunk-size-chars", type=int, default=200, help="Estimated server chunk size for benchmark metadata")
     parser.add_argument("--requests", type=int, default=20, help="Total number of requests")
     parser.add_argument("--concurrency", type=int, default=4, help="Concurrent HTTP requests")
     parser.add_argument("--language", default="", help="Optional language code, e.g. vi or de")
     parser.add_argument("--num-step", type=int, default=32, help="OmniVoice num_step")
     parser.add_argument("--speed", type=float, default=None, help="Optional speech speed factor, e.g. 1.1")
     parser.add_argument("--format", choices=["wav", "mp3"], default="mp3", help="Output format")
-    parser.add_argument("--mode", choices=["poll", "sync"], default="poll", help="Use polling jobs or sync audio response")
+    parser.add_argument("--mode", choices=["poll"], default="poll", help="Use async polling jobs")
     parser.add_argument("--poll-interval", type=float, default=0.5, help="Polling interval seconds for --mode poll")
     parser.add_argument("--timeout", type=float, default=300, help="Per-request timeout seconds")
     parser.add_argument("--output-dir", default="", help="Optional directory to save returned audio")

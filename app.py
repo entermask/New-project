@@ -3,6 +3,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -42,21 +43,17 @@ ASR_MODEL_NAME = os.getenv("OMNIVOICE_ASR_MODEL", "openai/whisper-large-v3-turbo
 DEVICE_MAP = os.getenv("OMNIVOICE_DEVICE", "cuda:0")
 API_TOKEN = os.getenv("API_TOKEN", "")
 CACHE_DIR = Path(os.getenv("OMNIVOICE_CACHE_DIR", "/ephemeral/omnivoice-cache"))
-MAX_TEXT_CHARS = int(os.getenv("OMNIVOICE_MAX_TEXT_CHARS", "3000"))
-MAX_CONCURRENCY = int(os.getenv("OMNIVOICE_CONCURRENCY", "4"))
 DOWNLOAD_TIMEOUT = float(os.getenv("OMNIVOICE_DOWNLOAD_TIMEOUT", "60"))
 REQUEST_TIMEOUT = float(os.getenv("OMNIVOICE_REQUEST_TIMEOUT", "300"))
 JOB_TTL_SECONDS = int(os.getenv("OMNIVOICE_JOB_TTL_SECONDS", "3600"))
-MAX_INFLIGHT_JOBS = max(1, int(os.getenv("OMNIVOICE_MAX_INFLIGHT_JOBS", "20")))
 SKIP_MODEL_LOAD = os.getenv("OMNIVOICE_SKIP_MODEL_LOAD", "0") == "1"
 GPU_PROFILE = os.getenv("OMNIVOICE_GPU_PROFILE", "auto").lower().strip()
 MODEL_DTYPE = os.getenv("OMNIVOICE_DTYPE", "fp16").lower().strip()
 ACCELERATION = os.getenv("OMNIVOICE_ACCELERATION", "base").lower().strip()
-ENABLE_BATCHING = os.getenv("OMNIVOICE_ENABLE_BATCHING", "1") == "1"
-BATCH_SIZE = max(1, int(os.getenv("OMNIVOICE_BATCH_SIZE", str(MAX_CONCURRENCY))))
+CHUNK_SIZE_CHARS = max(1, int(os.getenv("OMNIVOICE_CHUNK_SIZE_CHARS", "200")))
+BATCH_SIZE = max(1, int(os.getenv("OMNIVOICE_BATCH_SIZE", "12")))
 BATCH_MAX_WAIT_MS = max(0.0, float(os.getenv("OMNIVOICE_BATCH_MAX_WAIT_MS", "100")))
-BATCH_QUEUE_SIZE = max(1, int(os.getenv("OMNIVOICE_BATCH_QUEUE_SIZE", "256")))
-DEFERRED_MAX_SIZE = BATCH_QUEUE_SIZE * 2
+BUSY_BACKLOG_CHUNKS = max(1, int(os.getenv("OMNIVOICE_BUSY_BACKLOG_CHUNKS", str(BATCH_SIZE * 2))))
 JOB_CLEANUP_INTERVAL_SECONDS = 60
 
 SUPPORTED_FORMATS = {"wav", "mp3"}
@@ -76,11 +73,10 @@ model_loaded = False
 resolved_gpu_name: Optional[str] = None
 resolved_gpu_profile: Optional[str] = None
 resolved_model_dtype: Optional[str] = None
-generation_semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
-generation_queue: asyncio.Queue["BatchGenerationItem"] = asyncio.Queue(maxsize=BATCH_QUEUE_SIZE)
+generation_queue: asyncio.Queue["ChunkGenerationItem"] = asyncio.Queue()
 generation_batch_worker_task: Optional[asyncio.Task] = None
 gpu_generation_semaphore = asyncio.Semaphore(1)
-deferred_generation_items: deque["BatchGenerationItem"] = deque(maxlen=DEFERRED_MAX_SIZE)
+deferred_generation_items: deque["ChunkGenerationItem"] = deque()
 job_cleanup_task: Optional[asyncio.Task] = None
 active_requests = 0
 active_generations = 0
@@ -111,9 +107,12 @@ class ReferenceCacheEntry:
 
 
 @dataclass
-class BatchGenerationItem:
+class ChunkGenerationItem:
+    request_id: str
+    chunk_index: int
+    text: str
     req: TTSRequest
-    ref: ReferenceCacheEntry
+    voice_clone_prompt: object
     output_wav: Path
     future: asyncio.Future[str]
 
@@ -131,6 +130,10 @@ class TTSJob:
     transcript: str = ""
     audio_cache_hit: Optional[bool] = None
     cleanup_paths: Optional[list[Path]] = None
+    chunks_total: int = 0
+    chunks_completed: int = 0
+    chunks_failed: int = 0
+    input_chars: int = 0
 
 
 def _ensure_dirs() -> None:
@@ -185,6 +188,64 @@ def _write_transcript(ref_audio_url: str, transcript: str) -> None:
     }
     tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     tmp_path.replace(path)
+
+
+def _split_long_text_segment(segment: str, target_chars: int) -> list[str]:
+    chunks: list[str] = []
+    remaining = segment.strip()
+    soft_separators = [",", ";", ":", "，", "；", "：", " "]
+
+    while len(remaining) > target_chars:
+        cut = -1
+        for separator in soft_separators:
+            candidate = remaining.rfind(separator, 0, target_chars + 1)
+            if candidate > cut:
+                cut = candidate + (0 if separator == " " else 1)
+
+        if cut < max(1, target_chars // 2):
+            cut = target_chars
+
+        chunk = remaining[:cut].strip()
+        if chunk:
+            chunks.append(chunk)
+        remaining = remaining[cut:].strip()
+
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
+def _split_text_chunks(text: str) -> list[str]:
+    normalized = re.sub(r"\s+", " ", text.strip())
+    if not normalized:
+        return []
+
+    sentence_parts = re.split(r"(?<=[.!?。！？])\s+", normalized)
+    chunks: list[str] = []
+    current = ""
+
+    for part in sentence_parts:
+        part = part.strip()
+        if not part:
+            continue
+
+        pieces = (
+            _split_long_text_segment(part, CHUNK_SIZE_CHARS)
+            if len(part) > CHUNK_SIZE_CHARS
+            else [part]
+        )
+        for piece in pieces:
+            if not current:
+                current = piece
+            elif len(current) + 1 + len(piece) <= CHUNK_SIZE_CHARS:
+                current = f"{current} {piece}"
+            else:
+                chunks.append(current)
+                current = piece
+
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 async def _get_cache_lock(key: str) -> asyncio.Lock:
@@ -353,6 +414,12 @@ def _generation_kwargs(reqs: list[TTSRequest], voice_clone_prompts: list[object]
     return kwargs
 
 
+def _request_with_text(req: TTSRequest, text: str) -> TTSRequest:
+    if hasattr(req, "model_copy"):
+        return req.model_copy(update={"text": text})
+    return req.copy(update={"text": text})
+
+
 def _create_voice_clone_prompt(req: TTSRequest, ref: ReferenceCacheEntry) -> object:
     if model is None:
         raise RuntimeError("OmniVoice model is not loaded.")
@@ -382,27 +449,22 @@ def _generate_wav(req: TTSRequest, ref: ReferenceCacheEntry, output_path: Path) 
     return resolved_transcript or ""
 
 
-def _generate_wav_batch(items: list[BatchGenerationItem]) -> list[str]:
+def _generate_wav_batch(items: list[ChunkGenerationItem]) -> list[str]:
     if model is None:
         raise RuntimeError("OmniVoice model is not loaded.")
 
-    unique_refs = len({str(item.ref.audio_path) for item in items})
     logger.info(
-        "Batch generate: items=%d unique_refs=%d num_step=%d",
+        "Chunk batch generate: items=%d jobs=%d num_step=%d",
         len(items),
-        unique_refs,
+        len({item.request_id for item in items}),
         items[0].req.num_step,
     )
 
-    prompt_start = time.monotonic()
-    prompts = []
-    for item in items:
-        prompts.append(_create_voice_clone_prompt(item.req, item.ref))
-    prompt_elapsed = time.monotonic() - prompt_start
-
     gen_start = time.monotonic()
+    prompts = [item.voice_clone_prompt for item in items]
+    reqs = [_request_with_text(item.req, item.text) for item in items]
     transcripts = [prompt.ref_text or "" for prompt in prompts]
-    audios = model.generate(**_generation_kwargs([item.req for item in items], prompts))
+    audios = model.generate(**_generation_kwargs(reqs, prompts))
     gen_elapsed = time.monotonic() - gen_start
 
     if len(audios) != len(items):
@@ -414,9 +476,8 @@ def _generate_wav_batch(items: list[BatchGenerationItem]) -> list[str]:
     write_elapsed = time.monotonic() - write_start
 
     logger.info(
-        "Batch done: items=%d prompt=%.1fms generate=%.1fms write=%.1fms",
+        "Chunk batch done: items=%d generate=%.1fms write=%.1fms",
         len(items),
-        prompt_elapsed * 1000,
         gen_elapsed * 1000,
         write_elapsed * 1000,
     )
@@ -490,32 +551,39 @@ async def _get_runtime_metrics() -> dict[str, object]:
             "succeeded": sum(1 for job in tts_jobs.values() if job.status == "succeeded"),
             "failed": sum(1 for job in tts_jobs.values() if job.status == "failed"),
         }
+        active_tts_jobs = job_counts["queued"] + job_counts["running"]
 
     async with metrics_lock:
-        generation_capacity = BATCH_SIZE if ENABLE_BATCHING else MAX_CONCURRENCY
+        outstanding_chunks = queued_generations + active_generations
         return {
             "active_requests": active_requests,
             "active_generations": active_generations,
             "active_generation_batches": active_generation_batches,
             "queued_generations": queued_generations,
-            "deferred_generation_items": len(deferred_generation_items),
-            "max_concurrency": MAX_CONCURRENCY,
-            "generation_capacity": generation_capacity,
-            "available_generation_slots": max(generation_capacity - active_generations, 0),
-            "batching_enabled": ENABLE_BATCHING,
+            "queued_chunks": queued_generations,
+            "running_chunks": active_generations,
+            "outstanding_chunks": outstanding_chunks,
+            "deferred_chunks": len(deferred_generation_items),
+            "active_tts_jobs": active_tts_jobs,
+            "chunk_size_chars": CHUNK_SIZE_CHARS,
             "batch_size": BATCH_SIZE,
             "batch_max_wait_ms": BATCH_MAX_WAIT_MS,
-            "batch_queue_size": BATCH_QUEUE_SIZE,
-            "max_inflight_jobs": MAX_INFLIGHT_JOBS,
+            "busy_backlog_chunks": BUSY_BACKLOG_CHUNKS,
             "tts_jobs": job_counts,
         }
 
 
-def _inflight_job_count_locked() -> int:
-    return sum(1 for job in tts_jobs.values() if job.status in {"queued", "running"})
+async def _try_reserve_generation_chunks(count: int) -> tuple[bool, int]:
+    global queued_generations
+    async with metrics_lock:
+        outstanding_chunks = queued_generations + active_generations
+        if outstanding_chunks >= BUSY_BACKLOG_CHUNKS:
+            return False, outstanding_chunks
+        queued_generations += count
+        return True, outstanding_chunks
 
 
-def _batch_generation_key(item: BatchGenerationItem) -> tuple[int, Optional[float], Optional[str]]:
+def _batch_generation_key(item: ChunkGenerationItem) -> tuple[int, Optional[float], Optional[str]]:
     return (
         item.req.num_step,
         item.req.speed,
@@ -523,8 +591,8 @@ def _batch_generation_key(item: BatchGenerationItem) -> tuple[int, Optional[floa
     )
 
 
-def _group_batch_items(items: list[BatchGenerationItem]) -> list[list[BatchGenerationItem]]:
-    groups: dict[tuple[int, Optional[float], Optional[str]], list[BatchGenerationItem]] = {}
+def _group_batch_items(items: list[ChunkGenerationItem]) -> list[list[ChunkGenerationItem]]:
+    groups: dict[tuple[int, Optional[float], Optional[str]], list[ChunkGenerationItem]] = {}
     for item in items:
         groups.setdefault(_batch_generation_key(item), []).append(item)
     return list(groups.values())
@@ -532,7 +600,7 @@ def _group_batch_items(items: list[BatchGenerationItem]) -> list[list[BatchGener
 
 def _take_deferred_generation_item(
     key: Optional[tuple[int, Optional[float], Optional[str]]] = None,
-) -> Optional[BatchGenerationItem]:
+) -> Optional[ChunkGenerationItem]:
     if not deferred_generation_items:
         return None
     for index, item in enumerate(deferred_generation_items):
@@ -543,7 +611,7 @@ def _take_deferred_generation_item(
     return None
 
 
-async def _collect_generation_batch(first_item: BatchGenerationItem) -> list[BatchGenerationItem]:
+async def _collect_generation_batch(first_item: ChunkGenerationItem) -> list[ChunkGenerationItem]:
     batch = [first_item]
     batch_key = _batch_generation_key(first_item)
     deadline = asyncio.get_running_loop().time() + (BATCH_MAX_WAIT_MS / 1000)
@@ -579,7 +647,29 @@ async def _collect_generation_batch(first_item: BatchGenerationItem) -> list[Bat
     return batch
 
 
-async def _run_generation_batch(items: list[BatchGenerationItem]) -> None:
+async def _increment_job_chunks(request_id: str, *, completed: int = 0, failed: int = 0) -> None:
+    async with tts_jobs_lock:
+        job = tts_jobs.get(request_id)
+        if job is None:
+            return
+        job.chunks_completed += completed
+        job.chunks_failed += failed
+        job.updated_at = time.time()
+
+
+async def _fail_unfinished_job_chunks(request_id: str) -> int:
+    async with tts_jobs_lock:
+        job = tts_jobs.get(request_id)
+        if job is None:
+            return 0
+        unfinished = max(job.chunks_total - job.chunks_completed - job.chunks_failed, 0)
+        if unfinished:
+            job.chunks_failed += unfinished
+            job.updated_at = time.time()
+        return unfinished
+
+
+async def _run_generation_batch(items: list[ChunkGenerationItem]) -> None:
     live_items = [item for item in items if not item.future.cancelled()]
     await _queued_generation_delta(-len(items))
     if not live_items:
@@ -590,8 +680,13 @@ async def _run_generation_batch(items: list[BatchGenerationItem]) -> None:
     await _active_generation_batch_delta(1)
     await _active_generation_delta(len(live_items))
     try:
-        async with gpu_generation_semaphore:
-            transcripts = await asyncio.to_thread(_generate_wav_batch, live_items)
+        if SKIP_MODEL_LOAD:
+            for item in live_items:
+                _write_silent_test_wav(item.output_wav)
+            transcripts = ["" for _ in live_items]
+        else:
+            async with gpu_generation_semaphore:
+                transcripts = await asyncio.to_thread(_generate_wav_batch, live_items)
         if len(transcripts) != len(live_items):
             raise RuntimeError(
                 f"Batch generated {len(transcripts)} outputs for {len(live_items)} requests."
@@ -599,12 +694,14 @@ async def _run_generation_batch(items: list[BatchGenerationItem]) -> None:
         for item, transcript in zip(live_items, transcripts):
             if not item.future.done():
                 item.future.set_result(transcript)
+                await _increment_job_chunks(item.request_id, completed=1)
             elif item.future.cancelled():
                 _remove_files([item.output_wav])
     except Exception as exc:
         for item in live_items:
             if not item.future.done():
                 item.future.set_exception(exc)
+                await _increment_job_chunks(item.request_id, failed=1)
     finally:
         await _active_generation_delta(-len(live_items))
         await _active_generation_batch_delta(-1)
@@ -613,72 +710,94 @@ async def _run_generation_batch(items: list[BatchGenerationItem]) -> None:
 
 
 async def _generation_batch_worker() -> None:
-    current_tasks: list[asyncio.Task] = []
-
     while True:
-        # Collect next batch (runs concurrently with GPU generation of previous batch)
         first_item = _take_deferred_generation_item()
         if first_item is None:
             first_item = await generation_queue.get()
         batch = await _collect_generation_batch(first_item)
 
-        # Wait for previous batch to finish before dispatching new one
-        if current_tasks:
-            await asyncio.gather(*current_tasks, return_exceptions=True)
-            current_tasks.clear()
-
-        # Fire off new batch groups (gpu_generation_semaphore serializes GPU access)
         for group in _group_batch_items(batch):
-            current_tasks.append(asyncio.create_task(_run_generation_batch(group)))
+            await _run_generation_batch(group)
 
 
-async def _generate_response_audio_batched(
+def _merge_wavs(chunk_paths: list[Path], output_path: Path) -> None:
+    if not chunk_paths:
+        _write_silent_test_wav(output_path)
+        return
+
+    arrays = []
+    samplerate: Optional[int] = None
+    for chunk_path in chunk_paths:
+        audio, rate = sf.read(str(chunk_path), dtype="float32", always_2d=True)
+        if samplerate is None:
+            samplerate = rate
+        elif rate != samplerate:
+            raise RuntimeError(
+                f"Cannot merge chunk WAVs with different sample rates: {samplerate} and {rate}."
+            )
+        arrays.append(audio)
+
+    if not arrays or samplerate is None:
+        _write_silent_test_wav(output_path)
+        return
+
+    merged = np.concatenate(arrays, axis=0)
+    if merged.shape[1] == 1:
+        sf.write(str(output_path), merged[:, 0], samplerate)
+    else:
+        sf.write(str(output_path), merged, samplerate)
+
+
+async def _generate_chunked_response_audio(
+    request_id: str,
     req: TTSRequest,
     ref: ReferenceCacheEntry,
-    output_wav: Path,
-) -> str:
-    future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
-    item = BatchGenerationItem(
-        req=req,
-        ref=ref,
-        output_wav=output_wav,
-        future=future,
-    )
-    await _queued_generation_delta(1)
-    try:
-        await generation_queue.put(item)
-    except Exception:
-        await _queued_generation_delta(-1)
-        raise
-    return await future
-
-
-async def _generate_response_audio(
-    req: TTSRequest,
-    ref: ReferenceCacheEntry,
+    chunks: list[str],
     output_wav: Path,
     cleanup_paths: list[Path],
 ) -> tuple[Path, str, str]:
     transcript = ref.transcript or ""
-
-    if ENABLE_BATCHING and not SKIP_MODEL_LOAD:
-        transcript = await _generate_response_audio_batched(req, ref, output_wav)
+    if SKIP_MODEL_LOAD:
+        voice_clone_prompt = None
     else:
-        await _queued_generation_delta(1)
-        try:
-            await generation_semaphore.acquire()
-        finally:
-            await _queued_generation_delta(-1)
+        voice_clone_prompt = await asyncio.to_thread(_create_voice_clone_prompt, req, ref)
+        transcript = (voice_clone_prompt.ref_text or "").strip()
 
-        await _active_generation_delta(1)
-        try:
-            if SKIP_MODEL_LOAD:
-                _write_silent_test_wav(output_wav)
-            else:
-                transcript = await asyncio.to_thread(_generate_wav, req, ref, output_wav)
-        finally:
-            await _active_generation_delta(-1)
-            generation_semaphore.release()
+    futures: list[asyncio.Future[str]] = []
+    chunk_paths: list[Path] = []
+    for chunk_index, chunk_text in enumerate(chunks):
+        chunk_wav = Path(
+            tempfile.NamedTemporaryFile(delete=False, suffix=".wav", dir=TMP_DIR).name
+        )
+        cleanup_paths.append(chunk_wav)
+        chunk_paths.append(chunk_wav)
+        future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        item = ChunkGenerationItem(
+            request_id=request_id,
+            chunk_index=chunk_index,
+            text=chunk_text,
+            req=req,
+            voice_clone_prompt=voice_clone_prompt,
+            output_wav=chunk_wav,
+            future=future,
+        )
+        await generation_queue.put(item)
+        futures.append(future)
+
+    results = await asyncio.gather(*futures, return_exceptions=True)
+    errors = [result for result in results if isinstance(result, Exception)]
+    if errors:
+        raise RuntimeError(f"{len(errors)} TTS chunk(s) failed; first error: {errors[0]!r}")
+
+    for result in results:
+        if isinstance(result, str) and result.strip():
+            transcript = result.strip()
+            break
+
+    await asyncio.to_thread(_merge_wavs, chunk_paths, output_wav)
+    _remove_files(chunk_paths)
+    chunk_path_set = set(chunk_paths)
+    cleanup_paths[:] = [path for path in cleanup_paths if path not in chunk_path_set]
 
     if req.format == "mp3":
         output_mp3 = Path(tempfile.NamedTemporaryFile(delete=False, suffix=".mp3", dir=TMP_DIR).name)
@@ -714,6 +833,10 @@ def _job_payload(job: TTSJob) -> dict[str, object]:
         "created_at": job.created_at,
         "updated_at": job.updated_at,
         "status_url": f"/v1/tts/jobs/{job.request_id}",
+        "input_chars": job.input_chars,
+        "chunks_total": job.chunks_total,
+        "chunks_completed": job.chunks_completed,
+        "chunks_failed": job.chunks_failed,
     }
     if job.detail:
         payload["detail"] = job.detail
@@ -760,7 +883,7 @@ async def _periodic_job_cleanup() -> None:
             logger.exception("Error during periodic job cleanup")
 
 
-async def _run_tts_job(request_id: str, req: TTSRequest) -> None:
+async def _run_tts_job(request_id: str, req: TTSRequest, chunks: list[str]) -> None:
     await _set_job_state(request_id, status="running", detail=None)
     cleanup_paths: list[Path] = []
     output_wav = JOB_DIR / f"{request_id}.wav"
@@ -768,9 +891,13 @@ async def _run_tts_job(request_id: str, req: TTSRequest) -> None:
 
     try:
         ref = await _resolve_reference(req)
-        output_path, media_type, transcript = await asyncio.wait_for(
-            _generate_response_audio(req, ref, output_wav, cleanup_paths),
-            timeout=REQUEST_TIMEOUT,
+        output_path, media_type, transcript = await _generate_chunked_response_audio(
+            request_id,
+            req,
+            ref,
+            chunks,
+            output_wav,
+            cleanup_paths,
         )
 
         if output_path != output_wav:
@@ -791,16 +918,10 @@ async def _run_tts_job(request_id: str, req: TTSRequest) -> None:
             cleanup_paths=cleanup_paths,
         )
         logger.info("TTS async job %s succeeded", request_id)
-    except TimeoutError as exc:
-        _remove_files(cleanup_paths)
-        await _set_job_state(
-            request_id,
-            status="failed",
-            detail="TTS request timed out.",
-            cleanup_paths=[],
-        )
-        logger.warning("TTS async job %s timed out: %s", request_id, exc)
     except Exception as exc:
+        unfinished = await _fail_unfinished_job_chunks(request_id)
+        if unfinished:
+            await _queued_generation_delta(-unfinished)
         _remove_files(cleanup_paths)
         await _set_job_state(
             request_id,
@@ -824,11 +945,6 @@ def _validate_request(req: TTSRequest) -> None:
         raise HTTPException(status_code=400, detail="format must be wav or mp3.")
     if not req.text or not req.text.strip():
         raise HTTPException(status_code=400, detail="text is required.")
-    if len(req.text) > MAX_TEXT_CHARS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"text exceeds OMNIVOICE_MAX_TEXT_CHARS={MAX_TEXT_CHARS}.",
-        )
     if not req.ref_audio_url or not req.ref_audio_url.strip():
         raise HTTPException(status_code=400, detail="ref_audio_url is required.")
     parsed = urlparse(req.ref_audio_url)
@@ -845,14 +961,14 @@ async def startup() -> None:
     global generation_batch_worker_task, job_cleanup_task
     _ensure_dirs()
     await asyncio.to_thread(_load_model)
-    if ENABLE_BATCHING and not SKIP_MODEL_LOAD:
-        generation_batch_worker_task = asyncio.create_task(_generation_batch_worker())
-        logger.info(
-            "OmniVoice micro-batching enabled: batch_size=%s max_wait_ms=%s queue_size=%s.",
-            BATCH_SIZE,
-            BATCH_MAX_WAIT_MS,
-            BATCH_QUEUE_SIZE,
-        )
+    generation_batch_worker_task = asyncio.create_task(_generation_batch_worker())
+    logger.info(
+        "OmniVoice chunk scheduler started: chunk_size_chars=%s batch_size=%s max_wait_ms=%s busy_backlog_chunks=%s.",
+        CHUNK_SIZE_CHARS,
+        BATCH_SIZE,
+        BATCH_MAX_WAIT_MS,
+        BUSY_BACKLOG_CHUNKS,
+    )
     job_cleanup_task = asyncio.create_task(_periodic_job_cleanup())
     logger.info("Periodic job cleanup started (interval=%ds).", JOB_CLEANUP_INTERVAL_SECONDS)
 
@@ -904,6 +1020,25 @@ async def tts(
     _: None = Depends(_validate_token),
 ) -> JSONResponse:
     _validate_request(req)
+    chunks = _split_text_chunks(req.text)
+    if not chunks:
+        raise HTTPException(status_code=400, detail="text is required.")
+
+    reserved, outstanding_chunks = await _try_reserve_generation_chunks(len(chunks))
+    if not reserved:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "TTS chunk backlog is busy; retry later. "
+                f"outstanding_chunks={outstanding_chunks}, limit={BUSY_BACKLOG_CHUNKS}."
+            ),
+            headers={
+                "Retry-After": "1",
+                "X-Busy-Backlog-Chunks": str(BUSY_BACKLOG_CHUNKS),
+                "X-Outstanding-Chunks": str(outstanding_chunks),
+            },
+        )
+
     request_id = str(uuid.uuid4())
     now = time.time()
     job = TTSJob(
@@ -912,22 +1047,13 @@ async def tts(
         created_at=now,
         updated_at=now,
         format=req.format,
+        chunks_total=len(chunks),
+        input_chars=len(req.text.strip()),
     )
     async with tts_jobs_lock:
-        inflight_jobs = _inflight_job_count_locked()
-        if inflight_jobs >= MAX_INFLIGHT_JOBS:
-            raise HTTPException(
-                status_code=429,
-                detail=f"Too many in-flight TTS jobs; limit is {MAX_INFLIGHT_JOBS}.",
-                headers={
-                    "Retry-After": "1",
-                    "X-Max-Inflight-Jobs": str(MAX_INFLIGHT_JOBS),
-                    "X-Inflight-Jobs": str(inflight_jobs),
-                },
-            )
         tts_jobs[request_id] = job
 
-    background_tasks.add_task(_run_tts_job, request_id, req)
+    background_tasks.add_task(_run_tts_job, request_id, req, chunks)
     return JSONResponse(
         status_code=202,
         content=_job_payload(job),
@@ -936,19 +1062,6 @@ async def tts(
             "Location": f"/v1/tts/jobs/{request_id}",
         },
     )
-
-
-@app.post("/v1/tts/sync")
-async def tts_sync(
-    req: TTSRequest,
-    background_tasks: BackgroundTasks,
-    _: None = Depends(_validate_token),
-) -> Response:
-    await _request_delta(1)
-    try:
-        return await _tts(req, background_tasks)
-    finally:
-        await _request_delta(-1)
 
 
 @app.get("/v1/tts/jobs/{request_id}")
@@ -998,45 +1111,4 @@ async def get_tts_job_audio(
         media_type=media_type,
         filename=filename if download else None,
         headers=headers,
-    )
-
-
-async def _tts(req: TTSRequest, background_tasks: BackgroundTasks) -> Response:
-    _validate_request(req)
-    request_id = str(uuid.uuid4())
-    ref = await _resolve_reference(req)
-
-    output_wav = Path(tempfile.NamedTemporaryFile(delete=False, suffix=".wav", dir=TMP_DIR).name)
-    cleanup_paths = [output_wav]
-
-    try:
-        output_path, media_type, transcript = await asyncio.wait_for(
-            _generate_response_audio(req, ref, output_wav, cleanup_paths),
-            timeout=REQUEST_TIMEOUT,
-        )
-    except TimeoutError as exc:
-        _remove_files(cleanup_paths)
-        raise HTTPException(status_code=504, detail="TTS request timed out.") from exc
-    except HTTPException:
-        _remove_files(cleanup_paths)
-        raise
-    except Exception as exc:
-        _remove_files(cleanup_paths)
-        logger.exception("TTS request %s failed", request_id)
-        raise HTTPException(status_code=500, detail=f"TTS generation failed: {exc}") from exc
-
-    background_tasks.add_task(_remove_files, cleanup_paths)
-    headers = {
-        "X-Request-Id": request_id,
-        "X-Cache-Hit": str(ref.audio_cache_hit).lower(),
-        "X-Transcript": quote(transcript or "", safe=""),
-        "X-Transcript-Encoding": "urlencoded-utf8",
-    }
-    filename = f"{request_id}.{req.format}"
-    return FileResponse(
-        path=str(output_path),
-        media_type=media_type,
-        filename=filename,
-        headers=headers,
-        background=background_tasks,
     )
