@@ -114,7 +114,7 @@ if [[ -z "${MATRIX_MODELS+x}" ]]; then MATRIX_MODELS="k2-fsa/OmniVoice"; fi
 if [[ -z "${MATRIX_CONCURRENCIES+x}" ]]; then MATRIX_CONCURRENCIES="$DEFAULT_CONCURRENCIES"; fi
 if [[ -z "${MATRIX_DTYPES+x}" ]]; then MATRIX_DTYPES="$DEFAULT_DTYPES"; fi
 if [[ -z "${MATRIX_STEPS+x}" ]]; then MATRIX_STEPS="16 32"; fi
-if [[ -z "${MATRIX_SPEEDS+x}" ]]; then MATRIX_SPEEDS="1.0 1.1"; fi
+if [[ -z "${MATRIX_SPEEDS+x}" ]]; then MATRIX_SPEEDS="1.0"; fi
 if [[ -z "${MATRIX_REF_AUDIO_VARIANTS+x}" ]]; then MATRIX_REF_AUDIO_VARIANTS="1 4 requests"; fi
 
 ENV_FILE="$APP_DIR/.env"
