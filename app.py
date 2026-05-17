@@ -487,6 +487,8 @@ def _load_model() -> None:
             dtype=_torch_dtype(torch, model_dtype),
             load_asr=True,
             asr_model_name=ASR_MODEL_NAME,
+            compile_llm=True,
+            compile_kwargs={"mode": "max-autotune"}
         )
     resolved_gpu_name = gpu_name
     resolved_gpu_profile = gpu_profile
