@@ -208,17 +208,29 @@ Set `OMNIVOICE_ACCELERATION`:
 ```text
 base
 triton
+triton_sage
 hybrid
+hybrid_sage
 ```
 
-`base` is the official OmniVoice path and is the default. `triton` uses `omnivoice-triton` kernel fusion without CUDA Graph capture, so it is the safer optimized mode to test with chunk batching. `hybrid` uses CUDA Graph + Triton and should stay experimental; start with a small `OMNIVOICE_BATCH_SIZE`.
+`base` is the official OmniVoice path and is the default. `triton` uses `omnivoice-triton` kernel fusion without CUDA Graph capture, so it is the safer optimized mode to test with chunk batching. `triton_sage` adds SageAttention to the Triton path. `hybrid` uses CUDA Graph + Triton and should stay experimental; start with a small `OMNIVOICE_BATCH_SIZE`. `hybrid_sage` applies Triton + SageAttention before CUDA Graph capture.
+
+You can also keep `OMNIVOICE_ACCELERATION=triton` or `hybrid` and enable SageAttention with:
+
+```text
+OMNIVOICE_ENABLE_SAGE_ATTENTION=1
+```
+
+SageAttention must be installed in the OmniVoice virtualenv. If it is requested but unavailable, the API fails startup instead of silently falling back.
 
 Recommended testing order:
 
 ```text
-base   -> stable baseline
-triton -> safer optimization test
-hybrid -> single-flight experiment only
+base         -> stable baseline
+triton       -> safer optimization test
+triton_sage  -> Triton + SageAttention test
+hybrid       -> single-flight experiment only
+hybrid_sage  -> single-flight SageAttention experiment only
 ```
 
 ## Thunder Setup
@@ -494,7 +506,7 @@ python scripts/benchmark_tts.py --base-url "$BASE_URL" --token "$API_TOKEN" --re
 python scripts/benchmark_tts.py --base-url "$BASE_URL" --token "$API_TOKEN" --ref-audio-url "$REF_AUDIO_URL" --requests 20 --concurrency 4 --format mp3
 ```
 
-The server-side matrix defaults to `base` acceleration and now includes both short and long logical TTS jobs. Set `MATRIX_ACCELERATIONS="base triton"` only when you explicitly want to compare Triton. The matrix value named `MATRIX_CONCURRENCIES` is kept for compatibility with old reports; it now sets both benchmark client concurrency and `OMNIVOICE_BATCH_SIZE`.
+The server-side matrix defaults to `base` acceleration and now includes both short and long logical TTS jobs. Set `MATRIX_ACCELERATIONS="base triton triton_sage"` only when you explicitly want to compare Triton paths. Hybrid modes are skipped by the matrix because they should be tested as single-flight experiments. The matrix value named `MATRIX_CONCURRENCIES` is kept for compatibility with old reports; it now sets both benchmark client concurrency and `OMNIVOICE_BATCH_SIZE`.
 
 ```text
 MATRIX_TEXT_REPEATS="1 20"

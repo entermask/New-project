@@ -232,7 +232,7 @@ write_case_env() {
   local busy_backlog_chunks="$5"
   local batch_wait_ms="${OMNIVOICE_BATCH_MAX_WAIT_MS:-$DEFAULT_BATCH_MAX_WAIT_MS}"
 
-  grep -Ev '^(OMNIVOICE_MODEL|OMNIVOICE_ACCELERATION|OMNIVOICE_CONCURRENCY|OMNIVOICE_BATCH_SIZE|OMNIVOICE_BATCH_MAX_WAIT_MS|OMNIVOICE_BATCH_QUEUE_SIZE|OMNIVOICE_MAX_INFLIGHT_JOBS|OMNIVOICE_ENABLE_BATCHING|OMNIVOICE_CHUNK_SIZE_CHARS|OMNIVOICE_BUSY_BACKLOG_CHUNKS|OMNIVOICE_SKIP_MODEL_LOAD|OMNIVOICE_GPU_PROFILE|OMNIVOICE_DTYPE|API_TOKEN)=' "$ENV_BACKUP" > "$ENV_FILE" || true
+  grep -Ev '^(OMNIVOICE_MODEL|OMNIVOICE_ACCELERATION|OMNIVOICE_ENABLE_SAGE_ATTENTION|OMNIVOICE_CONCURRENCY|OMNIVOICE_BATCH_SIZE|OMNIVOICE_BATCH_MAX_WAIT_MS|OMNIVOICE_BATCH_QUEUE_SIZE|OMNIVOICE_MAX_INFLIGHT_JOBS|OMNIVOICE_ENABLE_BATCHING|OMNIVOICE_CHUNK_SIZE_CHARS|OMNIVOICE_BUSY_BACKLOG_CHUNKS|OMNIVOICE_SKIP_MODEL_LOAD|OMNIVOICE_GPU_PROFILE|OMNIVOICE_DTYPE|API_TOKEN)=' "$ENV_BACKUP" > "$ENV_FILE" || true
   {
     printf 'API_TOKEN=%q\n' "$API_TOKEN"
     printf 'OMNIVOICE_MODEL=%q\n' "$model_id"
@@ -508,7 +508,7 @@ resolve_busy_backlogs() {
   echo "- Batch max wait ms: ${OMNIVOICE_BATCH_MAX_WAIT_MS:-$DEFAULT_BATCH_MAX_WAIT_MS}"
   echo "- Format: $FORMAT"
   echo "- Mode: $MODE"
-  echo "- Hybrid: skipped"
+  echo "- Hybrid modes: skipped"
   echo
   echo "## Results"
   echo
@@ -531,8 +531,8 @@ for model_id in "${MODELS[@]}"; do
   model_slug="$(printf '%s' "$model_id" | tr '/:.' '___')"
   for dtype in "${DTYPES[@]}"; do
     for acceleration in "${ACCELERATIONS[@]}"; do
-      if [[ "$acceleration" == "hybrid" ]]; then
-        echo "Skipping hybrid acceleration"
+      if [[ "$acceleration" == "hybrid" || "$acceleration" == "hybrid_sage" ]]; then
+        echo "Skipping hybrid acceleration: $acceleration"
         continue
       fi
 

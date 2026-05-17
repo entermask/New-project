@@ -39,6 +39,10 @@ logging.basicConfig(
 logger = logging.getLogger("omnivoice-api")
 
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).lower().strip() in {"1", "true", "yes", "on"}
+
+
 MODEL_NAME = os.getenv("OMNIVOICE_MODEL", "k2-fsa/OmniVoice")
 ASR_MODEL_NAME = os.getenv("OMNIVOICE_ASR_MODEL", "openai/whisper-large-v3-turbo")
 DEVICE_MAP = os.getenv("OMNIVOICE_DEVICE", "cuda:0")
@@ -47,10 +51,13 @@ CACHE_DIR = Path(os.getenv("OMNIVOICE_CACHE_DIR", "/ephemeral/omnivoice-cache"))
 DOWNLOAD_TIMEOUT = float(os.getenv("OMNIVOICE_DOWNLOAD_TIMEOUT", "60"))
 REQUEST_TIMEOUT = float(os.getenv("OMNIVOICE_REQUEST_TIMEOUT", "300"))
 JOB_TTL_SECONDS = int(os.getenv("OMNIVOICE_JOB_TTL_SECONDS", "3600"))
-SKIP_MODEL_LOAD = os.getenv("OMNIVOICE_SKIP_MODEL_LOAD", "0") == "1"
+SKIP_MODEL_LOAD = _env_flag("OMNIVOICE_SKIP_MODEL_LOAD")
 GPU_PROFILE = os.getenv("OMNIVOICE_GPU_PROFILE", "auto").lower().strip()
 MODEL_DTYPE = os.getenv("OMNIVOICE_DTYPE", "fp16").lower().strip()
-ACCELERATION = os.getenv("OMNIVOICE_ACCELERATION", "base").lower().strip()
+REQUESTED_ACCELERATION = os.getenv("OMNIVOICE_ACCELERATION", "base").lower().strip().replace("-", "_")
+SAGE_ACCELERATION = REQUESTED_ACCELERATION.endswith("_sage")
+ACCELERATION = REQUESTED_ACCELERATION.removesuffix("_sage")
+ENABLE_SAGE_ATTENTION = _env_flag("OMNIVOICE_ENABLE_SAGE_ATTENTION") or SAGE_ACCELERATION
 CHUNK_SIZE_CHARS = max(1, int(os.getenv("OMNIVOICE_CHUNK_SIZE_CHARS", "200")))
 BRACKET_AUDIO_TAG_MAX_CHARS = 30
 BATCH_SIZE = max(1, int(os.getenv("OMNIVOICE_BATCH_SIZE", "12")))
@@ -61,6 +68,7 @@ JOB_CLEANUP_INTERVAL_SECONDS = 60
 
 SUPPORTED_FORMATS = {"wav", "mp3"}
 SUPPORTED_ACCELERATIONS = {"base", "triton", "hybrid"}
+SAGE_ACCELERATIONS = {"triton", "hybrid"}
 SUPPORTED_GPU_PROFILES = {"auto", "generic", "a100", "h100"}
 SUPPORTED_MODEL_DTYPES = {"fp16", "bf16"}
 REF_AUDIO_DIR = CACHE_DIR / "ref-audio"
@@ -309,7 +317,7 @@ def _voice_prompt_cache_key(req: TTSRequest, ref: ReferenceCacheEntry) -> str:
         json.dumps(
             {
                 "model": MODEL_NAME,
-                "acceleration": ACCELERATION,
+                "acceleration": _reported_acceleration(),
                 "audio_path": str(ref.audio_path),
                 "transcript": transcript,
             },
@@ -430,6 +438,58 @@ def _resolve_model_dtype() -> str:
     return MODEL_DTYPE
 
 
+def _reported_acceleration() -> str:
+    if ENABLE_SAGE_ATTENTION and ACCELERATION in SAGE_ACCELERATIONS:
+        return f"{ACCELERATION}_sage"
+    return ACCELERATION
+
+
+def _validate_acceleration_config() -> None:
+    if ACCELERATION not in SUPPORTED_ACCELERATIONS:
+        supported = sorted(SUPPORTED_ACCELERATIONS | {f"{name}_sage" for name in SAGE_ACCELERATIONS})
+        raise ValueError(
+            "OMNIVOICE_ACCELERATION must be one of: "
+            f"{', '.join(supported)}"
+        )
+    if ENABLE_SAGE_ATTENTION and ACCELERATION not in SAGE_ACCELERATIONS:
+        raise ValueError(
+            "OMNIVOICE_ENABLE_SAGE_ATTENTION=1 is only supported with "
+            "OMNIVOICE_ACCELERATION=triton or hybrid."
+        )
+
+
+def _ensure_sage_attention_available() -> None:
+    try:
+        import sageattention  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError(
+            "SageAttention was requested, but sageattention is not installed. "
+            "Install it in the OmniVoice virtualenv before starting the API."
+        ) from exc
+
+
+def _runner_accepts_sage_attention(acceleration: str) -> bool:
+    import inspect
+
+    from omnivoice_triton import get_runner_class
+
+    runner_class = get_runner_class(acceleration)
+    return "enable_sage_attention" in inspect.signature(runner_class).parameters
+
+
+def _apply_sage_attention_to_runner_model(runner: object) -> None:
+    from omnivoice_triton.models.patching import apply_sage_attention
+    from omnivoice_triton.models.patching import find_patchable_model
+
+    patchable_model = find_patchable_model(runner.model)
+    patched_count = apply_sage_attention(patchable_model)
+    if patched_count <= 0:
+        raise RuntimeError(
+            "SageAttention was requested, but no attention modules were patched."
+        )
+    logger.info("SageAttention patched after model load: %d attention modules.", patched_count)
+
+
 def _torch_dtype(torch_module: object, dtype_name: str) -> object:
     return torch_module.float16
 
@@ -441,11 +501,7 @@ def _load_model() -> None:
         logger.warning("OMNIVOICE_SKIP_MODEL_LOAD=1; model loading is disabled.")
         model_loaded = False
         return
-    if ACCELERATION not in SUPPORTED_ACCELERATIONS:
-        raise ValueError(
-            "OMNIVOICE_ACCELERATION must be one of: "
-            f"{', '.join(sorted(SUPPORTED_ACCELERATIONS))}"
-        )
+    _validate_acceleration_config()
 
     import torch
 
@@ -458,23 +514,38 @@ def _load_model() -> None:
     model_dtype = _resolve_model_dtype()
 
     logger.info(
-        "Loading OmniVoice model=%s device=%s acceleration=%s gpu_profile=%s dtype=%s ...",
+        "Loading OmniVoice model=%s device=%s acceleration=%s gpu_profile=%s dtype=%s sage_attention=%s ...",
         MODEL_NAME,
         DEVICE_MAP,
-        ACCELERATION,
+        _reported_acceleration(),
         gpu_profile,
         model_dtype,
+        ENABLE_SAGE_ATTENTION,
     )
     if ACCELERATION in {"triton", "hybrid"}:
         from omnivoice_triton import create_runner
 
-        runner = create_runner(
-            ACCELERATION,
-            device=DEVICE_MAP,
-            model_id=MODEL_NAME,
-            dtype=model_dtype,
-        )
+        runner_kwargs: dict[str, object] = {
+            "device": DEVICE_MAP,
+            "model_id": MODEL_NAME,
+            "dtype": model_dtype,
+        }
+        sage_attention_in_runner = False
+        if ENABLE_SAGE_ATTENTION:
+            _ensure_sage_attention_available()
+            sage_attention_in_runner = _runner_accepts_sage_attention(ACCELERATION)
+            if sage_attention_in_runner:
+                runner_kwargs["enable_sage_attention"] = True
+            elif ACCELERATION == "hybrid":
+                raise RuntimeError(
+                    "Hybrid+Sage requires an omnivoice-triton runner with "
+                    "enable_sage_attention support so Sage is patched before CUDA Graph capture."
+                )
+
+        runner = create_runner(ACCELERATION, **runner_kwargs)
         runner.load_model()
+        if ENABLE_SAGE_ATTENTION and not sage_attention_in_runner:
+            _apply_sage_attention_to_runner_model(runner)
         runner.model.load_asr_model(model_name=ASR_MODEL_NAME)
         model_runner = runner
         model = runner.model
@@ -495,10 +566,11 @@ def _load_model() -> None:
     resolved_model_dtype = model_dtype
     model_loaded = True
     logger.info(
-        "OmniVoice model loaded with acceleration=%s gpu_profile=%s dtype=%s.",
-        ACCELERATION,
+        "OmniVoice model loaded with acceleration=%s gpu_profile=%s dtype=%s sage_attention=%s.",
+        _reported_acceleration(),
         gpu_profile,
         model_dtype,
+        ENABLE_SAGE_ATTENTION,
     )
 
 
@@ -1110,7 +1182,9 @@ async def health() -> dict[str, object]:
         "dtype": resolved_model_dtype or MODEL_DTYPE,
         "cache_audio_count": len(list(REF_AUDIO_DIR.glob("*"))),
         "cache_transcript_count": len(list(TRANSCRIPT_DIR.glob("*.json"))),
-        "acceleration": ACCELERATION,
+        "acceleration": _reported_acceleration(),
+        "runner_acceleration": ACCELERATION,
+        "sage_attention": ENABLE_SAGE_ATTENTION,
         **runtime_metrics,
     }
 
