@@ -25,10 +25,10 @@ from fastapi import Depends
 from fastapi import FastAPI
 from fastapi import Header
 from fastapi import HTTPException
-from fastapi import Query
+
 from fastapi import Response
-from fastapi.responses import FileResponse
 from fastapi.responses import JSONResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 
@@ -51,8 +51,7 @@ SKIP_MODEL_LOAD = os.getenv("OMNIVOICE_SKIP_MODEL_LOAD", "0") == "1"
 GPU_PROFILE = os.getenv("OMNIVOICE_GPU_PROFILE", "auto").lower().strip()
 MODEL_DTYPE = os.getenv("OMNIVOICE_DTYPE", "fp16").lower().strip()
 ACCELERATION = os.getenv("OMNIVOICE_ACCELERATION", "base").lower().strip()
-CHUNK_SIZE_CHARS = max(1, int(os.getenv("OMNIVOICE_CHUNK_SIZE_CHARS", "200")))
-BRACKET_AUDIO_TAG_MAX_CHARS = 30
+
 BATCH_SIZE = max(1, int(os.getenv("OMNIVOICE_BATCH_SIZE", "12")))
 BATCH_MAX_WAIT_MS = max(0.0, float(os.getenv("OMNIVOICE_BATCH_MAX_WAIT_MS", "100")))
 BUSY_BACKLOG_CHUNKS = max(1, int(os.getenv("OMNIVOICE_BUSY_BACKLOG_CHUNKS", str(BATCH_SIZE * 2))))
@@ -96,7 +95,7 @@ voice_prompt_cache_guard = asyncio.Lock()
 
 
 class TTSRequest(BaseModel):
-    text: str
+    chunks: list[str]
     ref_audio_url: str
     ref_text: Optional[str] = None
     language: Optional[str] = None
@@ -131,8 +130,8 @@ class TTSJob:
     updated_at: float
     format: str
     detail: Optional[str] = None
-    output_path: Optional[Path] = None
-    media_type: Optional[str] = None
+    chunk_paths: Optional[list[Path]] = None
+    chunk_media_type: Optional[str] = None
     transcript: str = ""
     audio_cache_hit: Optional[bool] = None
     cleanup_paths: Optional[list[Path]] = None
@@ -196,102 +195,7 @@ def _write_transcript(ref_audio_url: str, transcript: str) -> None:
     tmp_path.replace(path)
 
 
-def _protected_bracket_spans(text: str) -> list[tuple[int, int]]:
-    spans: list[tuple[int, int]] = []
-    for match in re.finditer(r"\[([^\[\]\n]*)\]", text):
-        if len(match.group(1)) <= BRACKET_AUDIO_TAG_MAX_CHARS:
-            spans.append(match.span())
-    return spans
 
-
-def _is_inside_span(index: int, spans: list[tuple[int, int]]) -> bool:
-    return any(start < index < end for start, end in spans)
-
-
-def _adjust_cut_around_protected_span(text: str, cut: int) -> int:
-    for start, end in _protected_bracket_spans(text):
-        if start < cut < end:
-            if start > 0:
-                return start
-            return end
-    return cut
-
-
-def _split_sentence_parts(text: str) -> list[str]:
-    protected_spans = _protected_bracket_spans(text)
-    parts: list[str] = []
-    start = 0
-
-    for match in re.finditer(r"(?<=[.!?。！？])\s+", text):
-        if _is_inside_span(match.start(), protected_spans):
-            continue
-        parts.append(text[start : match.start()].strip())
-        start = match.end()
-
-    parts.append(text[start:].strip())
-    return [part for part in parts if part]
-
-
-def _split_long_text_segment(segment: str, target_chars: int) -> list[str]:
-    chunks: list[str] = []
-    remaining = segment.strip()
-    soft_separators = [",", ";", ":", "，", "；", "：", " "]
-
-    while len(remaining) > target_chars:
-        protected_spans = _protected_bracket_spans(remaining)
-        cut = -1
-        for separator in soft_separators:
-            candidate = remaining.rfind(separator, 0, target_chars + 1)
-            if candidate >= 0 and _is_inside_span(candidate, protected_spans):
-                continue
-            if candidate > cut:
-                cut = candidate + (0 if separator == " " else 1)
-
-        if cut < max(1, target_chars // 2):
-            cut = target_chars
-
-        cut = _adjust_cut_around_protected_span(remaining, cut)
-        chunk = remaining[:cut].strip()
-        if chunk:
-            chunks.append(chunk)
-        remaining = remaining[cut:].strip()
-
-    if remaining:
-        chunks.append(remaining)
-    return chunks
-
-
-def _split_text_chunks(text: str) -> list[str]:
-    normalized = re.sub(r"\s+", " ", text.strip())
-    if not normalized:
-        return []
-
-    sentence_parts = _split_sentence_parts(normalized)
-    chunks: list[str] = []
-    current = ""
-
-    for part in sentence_parts:
-        part = part.strip()
-        if not part:
-            continue
-
-        pieces = (
-            _split_long_text_segment(part, CHUNK_SIZE_CHARS)
-            if len(part) > CHUNK_SIZE_CHARS
-            else [part]
-        )
-        for piece in pieces:
-            if not current:
-                current = piece
-            elif len(current) + 1 + len(piece) <= CHUNK_SIZE_CHARS:
-                current = f"{current} {piece}"
-            else:
-                chunks.append(current)
-                current = piece
-
-    if current:
-        chunks.append(current)
-    return chunks
 
 
 async def _get_cache_lock(key: str) -> asyncio.Lock:
@@ -500,9 +404,9 @@ def _load_model() -> None:
     )
 
 
-def _generation_kwargs(reqs: list[TTSRequest], voice_clone_prompts: list[object]) -> dict[str, object]:
+def _generation_kwargs(texts: list[str], reqs: list[TTSRequest], voice_clone_prompts: list[object]) -> dict[str, object]:
     kwargs: dict[str, object] = {
-        "text": [req.text.strip() for req in reqs],
+        "text": [t.strip() for t in texts],
         "language": [req.language or None for req in reqs],
         "voice_clone_prompt": voice_clone_prompts,
         "num_step": reqs[0].num_step,
@@ -510,12 +414,6 @@ def _generation_kwargs(reqs: list[TTSRequest], voice_clone_prompts: list[object]
     if any(req.speed is not None for req in reqs):
         kwargs["speed"] = [req.speed for req in reqs]
     return kwargs
-
-
-def _request_with_text(req: TTSRequest, text: str) -> TTSRequest:
-    if hasattr(req, "model_copy"):
-        return req.model_copy(update={"text": text})
-    return req.copy(update={"text": text})
 
 
 def _create_voice_clone_prompt(req: TTSRequest, ref: ReferenceCacheEntry) -> object:
@@ -535,18 +433,6 @@ def _create_voice_clone_prompt(req: TTSRequest, ref: ReferenceCacheEntry) -> obj
     return voice_clone_prompt
 
 
-def _generate_wav(req: TTSRequest, ref: ReferenceCacheEntry, output_path: Path) -> str:
-    if model is None:
-        raise RuntimeError("OmniVoice model is not loaded.")
-
-    voice_clone_prompt = _create_voice_clone_prompt(req, ref)
-    resolved_transcript = voice_clone_prompt.ref_text
-
-    audios = model.generate(**_generation_kwargs([req], [voice_clone_prompt]))
-    sf.write(str(output_path), audios[0], model.sampling_rate)
-    return resolved_transcript or ""
-
-
 def _generate_wav_batch(items: list[ChunkGenerationItem]) -> list[str]:
     if model is None:
         raise RuntimeError("OmniVoice model is not loaded.")
@@ -559,10 +445,11 @@ def _generate_wav_batch(items: list[ChunkGenerationItem]) -> list[str]:
     )
 
     gen_start = time.monotonic()
+    texts = [item.text for item in items]
     prompts = [item.voice_clone_prompt for item in items]
-    reqs = [_request_with_text(item.req, item.text) for item in items]
+    reqs = [item.req for item in items]
     transcripts = [prompt.ref_text or "" for prompt in prompts]
-    audios = model.generate(**_generation_kwargs(reqs, prompts))
+    audios = model.generate(**_generation_kwargs(texts, reqs, prompts))
     gen_elapsed = time.monotonic() - gen_start
 
     if len(audios) != len(items):
@@ -663,7 +550,7 @@ async def _get_runtime_metrics() -> dict[str, object]:
             "outstanding_chunks": outstanding_chunks,
             "deferred_chunks": len(deferred_generation_items),
             "active_tts_jobs": active_tts_jobs,
-            "chunk_size_chars": CHUNK_SIZE_CHARS,
+
             "batch_size": BATCH_SIZE,
             "batch_max_wait_ms": BATCH_MAX_WAIT_MS,
             "busy_backlog_chunks": BUSY_BACKLOG_CHUNKS,
@@ -820,42 +707,13 @@ async def _generation_batch_worker() -> None:
             await _run_generation_batch(group)
 
 
-def _merge_wavs(chunk_paths: list[Path], output_path: Path) -> None:
-    if not chunk_paths:
-        _write_silent_test_wav(output_path)
-        return
-
-    arrays = []
-    samplerate: Optional[int] = None
-    for chunk_path in chunk_paths:
-        audio, rate = sf.read(str(chunk_path), dtype="float32", always_2d=True)
-        if samplerate is None:
-            samplerate = rate
-        elif rate != samplerate:
-            raise RuntimeError(
-                f"Cannot merge chunk WAVs with different sample rates: {samplerate} and {rate}."
-            )
-        arrays.append(audio)
-
-    if not arrays or samplerate is None:
-        _write_silent_test_wav(output_path)
-        return
-
-    merged = np.concatenate(arrays, axis=0)
-    if merged.shape[1] == 1:
-        sf.write(str(output_path), merged[:, 0], samplerate)
-    else:
-        sf.write(str(output_path), merged, samplerate)
-
-
-async def _generate_chunked_response_audio(
+async def _generate_per_chunk_audio(
     request_id: str,
     req: TTSRequest,
     ref: ReferenceCacheEntry,
     chunks: list[str],
-    output_wav: Path,
     cleanup_paths: list[Path],
-) -> tuple[Path, str, str]:
+) -> tuple[list[Path], str, str]:
     transcript = ref.transcript or ""
     if SKIP_MODEL_LOAD:
         voice_clone_prompt = None
@@ -864,13 +722,13 @@ async def _generate_chunked_response_audio(
         transcript = (voice_clone_prompt.ref_text or "").strip()
 
     futures: list[asyncio.Future[str]] = []
-    chunk_paths: list[Path] = []
+    chunk_wav_paths: list[Path] = []
     for chunk_index, chunk_text in enumerate(chunks):
         chunk_wav = Path(
             tempfile.NamedTemporaryFile(delete=False, suffix=".wav", dir=TMP_DIR).name
         )
         cleanup_paths.append(chunk_wav)
-        chunk_paths.append(chunk_wav)
+        chunk_wav_paths.append(chunk_wav)
         future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
         item = ChunkGenerationItem(
             request_id=request_id,
@@ -894,18 +752,21 @@ async def _generate_chunked_response_audio(
             transcript = result.strip()
             break
 
-    await asyncio.to_thread(_merge_wavs, chunk_paths, output_wav)
-    _remove_files(chunk_paths)
-    chunk_path_set = set(chunk_paths)
-    cleanup_paths[:] = [path for path in cleanup_paths if path not in chunk_path_set]
-
     if req.format == "mp3":
-        output_mp3 = Path(tempfile.NamedTemporaryFile(delete=False, suffix=".mp3", dir=TMP_DIR).name)
-        cleanup_paths.append(output_mp3)
-        await asyncio.to_thread(_convert_wav_to_mp3, output_wav, output_mp3)
-        return output_mp3, "audio/mpeg", transcript
+        chunk_output_paths: list[Path] = []
+        for chunk_wav in chunk_wav_paths:
+            chunk_mp3 = Path(
+                tempfile.NamedTemporaryFile(delete=False, suffix=".mp3", dir=TMP_DIR).name
+            )
+            cleanup_paths.append(chunk_mp3)
+            await asyncio.to_thread(_convert_wav_to_mp3, chunk_wav, chunk_mp3)
+            chunk_output_paths.append(chunk_mp3)
+        _remove_files(chunk_wav_paths)
+        wav_set = set(chunk_wav_paths)
+        cleanup_paths[:] = [p for p in cleanup_paths if p not in wav_set]
+        return chunk_output_paths, "audio/mpeg", transcript
 
-    return output_wav, "audio/wav", transcript
+    return chunk_wav_paths, "audio/wav", transcript
 
 
 def _remove_files(paths: list[Path]) -> None:
@@ -983,41 +844,40 @@ async def _periodic_job_cleanup() -> None:
             logger.exception("Error during periodic job cleanup")
 
 
-async def _run_tts_job(request_id: str, req: TTSRequest, chunks: list[str]) -> None:
+async def _run_tts_job(request_id: str, req: TTSRequest) -> None:
     await _set_job_state(request_id, status="running", detail=None)
     cleanup_paths: list[Path] = []
-    output_wav = JOB_DIR / f"{request_id}.wav"
-    cleanup_paths.append(output_wav)
 
     try:
         ref = await _resolve_reference(req)
-        output_path, media_type, transcript = await _generate_chunked_response_audio(
+        chunk_output_paths, media_type, transcript = await _generate_per_chunk_audio(
             request_id,
             req,
             ref,
-            chunks,
-            output_wav,
+            req.chunks,
             cleanup_paths,
         )
 
-        if output_path != output_wav:
-            final_path = JOB_DIR / f"{request_id}.{req.format}"
-            output_path.replace(final_path)
-            cleanup_paths = [path for path in cleanup_paths if path != output_path]
-            cleanup_paths.append(final_path)
-            output_path = final_path
+        ext = "mp3" if req.format == "mp3" else "wav"
+        final_chunk_paths: list[Path] = []
+        for i, src_path in enumerate(chunk_output_paths):
+            dst_path = JOB_DIR / f"{request_id}_chunk{i}.{ext}"
+            src_path.replace(dst_path)
+            cleanup_paths = [p for p in cleanup_paths if p != src_path]
+            cleanup_paths.append(dst_path)
+            final_chunk_paths.append(dst_path)
 
         await _set_job_state(
             request_id,
             status="succeeded",
             detail=None,
-            output_path=output_path,
-            media_type=media_type,
+            chunk_paths=final_chunk_paths,
+            chunk_media_type=media_type,
             transcript=transcript,
             audio_cache_hit=ref.audio_cache_hit,
             cleanup_paths=cleanup_paths,
         )
-        logger.info("TTS async job %s succeeded", request_id)
+        logger.info("TTS async job %s succeeded (%d chunks)", request_id, len(final_chunk_paths))
     except Exception as exc:
         unfinished = await _fail_unfinished_job_chunks(request_id)
         if unfinished:
@@ -1043,8 +903,9 @@ def _validate_request(req: TTSRequest) -> None:
     req.format = req.format.lower().strip()
     if req.format not in SUPPORTED_FORMATS:
         raise HTTPException(status_code=400, detail="format must be wav or mp3.")
-    if not req.text or not req.text.strip():
-        raise HTTPException(status_code=400, detail="text is required.")
+    if not req.chunks or not any(c.strip() for c in req.chunks):
+        raise HTTPException(status_code=400, detail="chunks is required and must contain non-empty strings.")
+    req.chunks = [c.strip() for c in req.chunks if c.strip()]
     if not req.ref_audio_url or not req.ref_audio_url.strip():
         raise HTTPException(status_code=400, detail="ref_audio_url is required.")
     parsed = urlparse(req.ref_audio_url)
@@ -1063,8 +924,7 @@ async def startup() -> None:
     await asyncio.to_thread(_load_model)
     generation_batch_worker_task = asyncio.create_task(_generation_batch_worker())
     logger.info(
-        "OmniVoice chunk scheduler started: chunk_size_chars=%s batch_size=%s max_wait_ms=%s busy_backlog_chunks=%s.",
-        CHUNK_SIZE_CHARS,
+        "OmniVoice chunk scheduler started: batch_size=%s max_wait_ms=%s busy_backlog_chunks=%s.",
         BATCH_SIZE,
         BATCH_MAX_WAIT_MS,
         BUSY_BACKLOG_CHUNKS,
@@ -1120,9 +980,7 @@ async def tts(
     _: None = Depends(_validate_token),
 ) -> JSONResponse:
     _validate_request(req)
-    chunks = _split_text_chunks(req.text)
-    if not chunks:
-        raise HTTPException(status_code=400, detail="text is required.")
+    chunks = req.chunks
 
     reserved, outstanding_chunks = await _try_reserve_generation_chunks(len(chunks))
     if not reserved:
@@ -1148,12 +1006,12 @@ async def tts(
         updated_at=now,
         format=req.format,
         chunks_total=len(chunks),
-        input_chars=len(req.text.strip()),
+        input_chars=sum(len(c) for c in chunks),
     )
     async with tts_jobs_lock:
         tts_jobs[request_id] = job
 
-    background_tasks.add_task(_run_tts_job, request_id, req, chunks)
+    background_tasks.add_task(_run_tts_job, request_id, req)
     return JSONResponse(
         status_code=202,
         content=_job_payload(job),
@@ -1180,7 +1038,6 @@ async def get_tts_job(
 @app.get("/v1/tts/jobs/{request_id}/audio")
 async def get_tts_job_audio(
     request_id: str,
-    download: bool = Query(default=True),
     _: None = Depends(_validate_token),
 ) -> Response:
     async with tts_jobs_lock:
@@ -1189,26 +1046,34 @@ async def get_tts_job_audio(
             raise HTTPException(status_code=404, detail="TTS job not found.")
         if job.status != "succeeded":
             raise HTTPException(status_code=409, detail=f"TTS job is {job.status}.")
-        if job.output_path is None or job.media_type is None:
+        if not job.chunk_paths:
             raise HTTPException(status_code=500, detail="TTS job audio is missing.")
-        output_path = job.output_path
-        media_type = job.media_type
+        chunk_paths = list(job.chunk_paths)
+        media_type = job.chunk_media_type or "audio/wav"
         transcript = job.transcript
         cache_hit = job.audio_cache_hit
 
-    if not output_path.exists():
-        raise HTTPException(status_code=410, detail="TTS job audio expired.")
+    for path in chunk_paths:
+        if not path.exists():
+            raise HTTPException(status_code=410, detail="TTS job audio expired.")
+
+    async def stream_length_prefixed():
+        yield len(chunk_paths).to_bytes(4, "big")
+        for path in chunk_paths:
+            data = path.read_bytes()
+            yield len(data).to_bytes(4, "big")
+            yield data
 
     headers = {
         "X-Request-Id": request_id,
         "X-Cache-Hit": str(bool(cache_hit)).lower(),
         "X-Transcript": quote(transcript or "", safe=""),
         "X-Transcript-Encoding": "urlencoded-utf8",
+        "X-Chunks-Total": str(len(chunk_paths)),
+        "X-Audio-Format": media_type,
     }
-    filename = f"{request_id}{output_path.suffix}"
-    return FileResponse(
-        path=str(output_path),
-        media_type=media_type,
-        filename=filename if download else None,
+    return StreamingResponse(
+        stream_length_prefixed(),
+        media_type="application/octet-stream",
         headers=headers,
     )

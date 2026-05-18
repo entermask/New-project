@@ -53,7 +53,7 @@ Request:
 
 ```json
 {
-  "text": "Noi dung can doc",
+  "chunks": ["Đoạn thứ nhất.", "Đoạn thứ hai."],
   "ref_audio_url": "https://example.com/reference.wav",
   "ref_text": "Optional transcript",
   "language": "vi",
@@ -63,7 +63,7 @@ Request:
 }
 ```
 
-Required fields: `text`, `ref_audio_url`.
+Required fields: `chunks`, `ref_audio_url`.
 
 Defaults:
 
@@ -115,21 +115,28 @@ When the job succeeds, the status response includes:
 }
 ```
 
-Download the audio:
+Audio response is a **length-prefixed binary stream** (`application/octet-stream`). Each chunk is a complete audio file:
 
-```http
-GET /v1/tts/jobs/<request_id>/audio
+```text
+[4 bytes: chunk_count uint32 BE]
+[4 bytes: chunk_0_size uint32 BE][chunk_0 binary]
+[4 bytes: chunk_1_size uint32 BE][chunk_1 binary]
+...
 ```
 
 Audio response headers:
 
 ```http
-Content-Type: audio/wav or audio/mpeg
+Content-Type: application/octet-stream
 X-Request-Id: <uuid>
+X-Chunks-Total: 3
+X-Audio-Format: audio/wav or audio/mpeg
 X-Cache-Hit: true|false
 X-Transcript: <url-encoded-transcript>
 X-Transcript-Encoding: urlencoded-utf8
 ```
+
+See `MIGRATION_CHUNKS_API.md` for full client integration guide with Node.js examples.
 
 Completed job metadata and audio files are kept for `OMNIVOICE_JOB_TTL_SECONDS`, default `3600`.
 
@@ -139,7 +146,7 @@ Example:
 JOB_JSON=$(curl -sS -X POST "$BASE_URL/v1/tts" \
   -H "Authorization: Bearer $API_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"text":"Xin chao","ref_audio_url":"https://example.com/ref.wav","format":"mp3","num_step":16}')
+  -d '{"chunks":["Xin chao","Day la test"],"ref_audio_url":"https://example.com/ref.wav","format":"mp3","num_step":16}')
 
 STATUS_URL=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["status_url"])' <<< "$JOB_JSON")
 curl -sS -H "Authorization: Bearer $API_TOKEN" "$BASE_URL$STATUS_URL"
@@ -164,14 +171,13 @@ If `ref_text` is provided, it is used and written to transcript cache. If `ref_t
 `/v1/tts` is the only public TTS endpoint. Every request becomes one logical TTS job. The server splits the input text into small chunks, creates one `voice_clone_prompt` for the job, generates chunk audio in GPU batches, then merges chunks into the final audio file.
 
 ```text
-OMNIVOICE_CHUNK_SIZE_CHARS=200
 OMNIVOICE_BATCH_SIZE=12
 OMNIVOICE_BUSY_BACKLOG_CHUNKS=24
 OMNIVOICE_BATCH_MAX_WAIT_MS=50
 OMNIVOICE_JOB_TTL_SECONDS=3600
 ```
 
-`OMNIVOICE_CHUNK_SIZE_CHARS` is a target, not a hard split point. The splitter prefers sentence and punctuation boundaries, then whitespace, then a hard cut for very long spans.
+Client is responsible for splitting text into chunks before submitting. See `MIGRATION_CHUNKS_API.md` for splitting guidelines (recommended: 150–250 chars per chunk, split at sentence boundaries).
 
 `OMNIVOICE_BATCH_SIZE` is the maximum number of chunks sent to one `model.generate(...)` call. Compatible chunks are grouped by `num_step`, `speed`, and `language`.
 
