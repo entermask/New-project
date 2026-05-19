@@ -9,8 +9,6 @@ VENV_DIR="${VENV_DIR:-$HOME/venvs/omnivoice-api}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8001}"
 RESTART="${RESTART:-1}"
-WORKERS="${WORKERS:-5}"
-USE_MPS="${USE_MPS:-1}"
 
 if ! command -v tmux >/dev/null 2>&1; then
   echo "tmux is not installed. Run: sudo apt-get update && sudo apt-get install -y tmux" >&2
@@ -52,37 +50,12 @@ if [ -d "$SITE_PACKAGES/nvidia/cudnn/lib" ]; then
   fi
 fi
 
-# Enable NVIDIA MPS if requested and nvidia-smi is available
-if [ "$USE_MPS" = "1" ] && command -v nvidia-smi >/dev/null 2>&1; then
-  echo "Setting up NVIDIA MPS (Multi-Process Service)..."
-  
-  # 1. Try to set EXCLUSIVE_PROCESS mode for GPU 0
-  if nvidia-smi -i 0 -c EXCLUSIVE_PROCESS >/dev/null 2>&1; then
-    echo "GPU 0 set to EXCLUSIVE_PROCESS mode."
-  elif sudo nvidia-smi -i 0 -c EXCLUSIVE_PROCESS >/dev/null 2>&1; then
-    echo "GPU 0 set to EXCLUSIVE_PROCESS mode using sudo."
-  else
-    echo "Warning: Could not set GPU 0 to EXCLUSIVE_PROCESS mode. Skipping mode change..."
-  fi
-
-  # 2. Start the MPS control daemon
-  if nvidia-cuda-mps-control -d >/dev/null 2>&1; then
-    echo "NVIDIA MPS control daemon started."
-  else
-    if pgrep nvidia-cuda-mps >/dev/null 2>&1; then
-      echo "NVIDIA MPS control daemon is already running."
-    else
-      echo "Warning: Failed to start NVIDIA MPS control daemon."
-    fi
-  fi
-fi
-
 tmux new-session -d -s "$SESSION_NAME" \
   "cd '$APP_DIR' && \
    source '$VENV_DIR/bin/activate' && \
    set -a && source .env && set +a && \
    ${EXTRA_PATHS:+export LD_LIBRARY_PATH=\"\$LD_LIBRARY_PATH:$EXTRA_PATHS\" &&} \
-   exec '$VENV_DIR/bin/uvicorn' app:app --host '$HOST' --port '$PORT' --workers '$WORKERS'"
+   exec '$VENV_DIR/bin/uvicorn' app:app --host '$HOST' --port '$PORT'"
 
 echo "Started OmniVoice API in tmux session '$SESSION_NAME' on $HOST:$PORT"
 echo "Attaching to session '$SESSION_NAME' now... (Detach with Ctrl+B then D)"

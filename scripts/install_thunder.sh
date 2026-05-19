@@ -131,7 +131,7 @@ source "$VENV_DIR/bin/activate"
 
 python -m pip install -U pip wheel
 python -m pip install -r requirements.txt
-python -m pip install omnivoice-triton --no-deps
+python -m pip install git+https://github.com/entermask/omnivoice-triton.git --no-deps
 
 cp .env.example .env
 

@@ -676,7 +676,6 @@ async def _increment_job_chunks(request_id: str, *, completed: int = 0, failed: 
         job.chunks_completed += completed
         job.chunks_failed += failed
         job.updated_at = time.time()
-        _save_tts_job_to_disk(job)
 
 
 async def _fail_unfinished_job_chunks(request_id: str) -> int:
@@ -688,7 +687,6 @@ async def _fail_unfinished_job_chunks(request_id: str) -> int:
         if unfinished:
             job.chunks_failed += unfinished
             job.updated_at = time.time()
-            _save_tts_job_to_disk(job)
         return unfinished
 
 
@@ -821,7 +819,6 @@ async def _set_job_state(request_id: str, **updates: object) -> None:
         for key, value in updates.items():
             setattr(job, key, value)
         job.updated_at = time.time()
-        _save_tts_job_to_disk(job)
 
 
 def _job_payload(job: TTSJob) -> dict[str, object]:
@@ -851,19 +848,6 @@ def _job_payload(job: TTSJob) -> dict[str, object]:
     return payload
 
 
-def _save_tts_job_to_disk(job: TTSJob) -> None:
-    try:
-        payload = _job_payload(job)
-        payload["_chunk_paths"] = [str(p) for p in (job.chunk_paths or [])]
-        payload["_chunk_media_type"] = job.chunk_media_type
-        payload["_cleanup_paths"] = [str(p) for p in (job.cleanup_paths or [])]
-        
-        file_path = JOB_DIR / f"{job.request_id}.json"
-        file_path.write_text(json.dumps(payload, ensure_ascii=False))
-    except Exception as e:
-        logger.warning("Failed to save TTS job %s to disk: %s", job.request_id, e)
-
-
 async def _cleanup_expired_jobs() -> None:
     if JOB_TTL_SECONDS <= 0:
         return
@@ -881,11 +865,6 @@ async def _cleanup_expired_jobs() -> None:
     for job in expired:
         if job.cleanup_paths:
             _remove_files(job.cleanup_paths)
-        try:
-            json_file = JOB_DIR / f"{job.request_id}.json"
-            json_file.unlink(missing_ok=True)
-        except Exception:
-            pass
     if expired:
         logger.info("Cleaned up %d expired TTS jobs.", len(expired))
 
@@ -910,35 +889,8 @@ async def _cleanup_expired_stt_jobs() -> None:
                 job.file_path.unlink()
             except OSError as exc:
                 logger.warning("Could not delete expired STT file %s: %s", job.file_path, exc)
-        try:
-            stt_dir = TMP_DIR / "stt"
-            json_file = stt_dir / f"{job.job_id}.json"
-            json_file.unlink(missing_ok=True)
-        except Exception:
-            pass
     if expired:
         logger.info("Cleaned up %d expired STT jobs.", len(expired))
-
-
-def _save_stt_job_to_disk(job: STTJob) -> None:
-    try:
-        payload = {
-            "job_id": job.job_id,
-            "status": job.status,
-            "created_at": job.created_at,
-            "updated_at": job.updated_at,
-        }
-        if job.status == "completed":
-            payload["result"] = job.result
-        elif job.status == "failed":
-            payload["error"] = job.error
-        
-        stt_dir = TMP_DIR / "stt"
-        stt_dir.mkdir(parents=True, exist_ok=True)
-        file_path = stt_dir / f"{job.job_id}.json"
-        file_path.write_text(json.dumps(payload, ensure_ascii=False))
-    except Exception as e:
-        logger.warning("Failed to save STT job %s to disk: %s", job.job_id, e)
 
 
 async def _periodic_job_cleanup() -> None:
@@ -1138,7 +1090,6 @@ async def tts(
     )
     async with tts_jobs_lock:
         tts_jobs[request_id] = job
-        _save_tts_job_to_disk(job)
 
     background_tasks.add_task(_run_tts_job, request_id, req)
     return JSONResponse(
@@ -1159,14 +1110,6 @@ async def get_tts_job(
     async with tts_jobs_lock:
         job = tts_jobs.get(request_id)
         if job is None:
-            file_path = JOB_DIR / f"{request_id}.json"
-            if file_path.exists():
-                try:
-                    payload = json.loads(file_path.read_text())
-                    user_payload = {k: v for k, v in payload.items() if not k.startswith("_")}
-                    return JSONResponse(content=user_payload)
-                except Exception as e:
-                    logger.warning("Failed to read TTS job %s from disk: %s", request_id, e)
             raise HTTPException(status_code=404, detail="TTS job not found.")
         payload = _job_payload(job)
     return JSONResponse(content=payload)
@@ -1180,23 +1123,7 @@ async def get_tts_job_audio(
     async with tts_jobs_lock:
         job = tts_jobs.get(request_id)
         if job is None:
-            file_path = JOB_DIR / f"{request_id}.json"
-            if file_path.exists():
-                try:
-                    data = json.loads(file_path.read_text())
-                    class DummyTTSJob:
-                        pass
-                    job = DummyTTSJob()
-                    job.status = data.get("status")
-                    job.chunk_paths = [Path(p) for p in data.get("_chunk_paths", [])]
-                    job.chunk_media_type = data.get("_chunk_media_type")
-                    job.transcript = data.get("transcript")
-                    job.audio_cache_hit = data.get("cache_hit")
-                except Exception as e:
-                    logger.warning("Failed to load TTS job %s audio metadata from disk: %s", request_id, e)
-                    job = None
-            if job is None:
-                raise HTTPException(status_code=404, detail="TTS job not found.")
+            raise HTTPException(status_code=404, detail="TTS job not found.")
         if job.status != "succeeded":
             raise HTTPException(status_code=409, detail=f"TTS job is {job.status}.")
         if not job.chunk_paths:
@@ -1288,7 +1215,6 @@ async def _run_stt_job_async(job_id: str, file_path: Path, language: Optional[st
         if job:
             job.status = "running"
             job.updated_at = time.time()
-            _save_stt_job_to_disk(job)
 
     try:
         await _ensure_whisper_model()
@@ -1338,7 +1264,6 @@ async def _run_stt_job_async(job_id: str, file_path: Path, language: Optional[st
                 job.status = "completed"
                 job.result = result
                 job.updated_at = time.time()
-                _save_stt_job_to_disk(job)
                 
     except Exception as exc:
         logger.exception("Error during async STT job %s", job_id)
@@ -1348,7 +1273,6 @@ async def _run_stt_job_async(job_id: str, file_path: Path, language: Optional[st
                 job.status = "failed"
                 job.error = str(exc)
                 job.updated_at = time.time()
-                _save_stt_job_to_disk(job)
 
 
 async def _transcribe_sync(file_path: Path, language: Optional[str], beam_size: int, vad_filter: bool, word_timestamps: bool) -> dict:
@@ -1445,7 +1369,6 @@ async def transcribe_audio(
         )
         async with stt_jobs_lock:
             stt_jobs[job_id] = job
-            _save_stt_job_to_disk(job)
             
         background_tasks.add_task(
             _run_stt_job_async,
@@ -1474,14 +1397,6 @@ async def get_stt_job_status(
     async with stt_jobs_lock:
         job = stt_jobs.get(job_id)
         if job is None:
-            stt_dir = TMP_DIR / "stt"
-            file_path = stt_dir / f"{job_id}.json"
-            if file_path.exists():
-                try:
-                    payload = json.loads(file_path.read_text())
-                    return JSONResponse(content=payload)
-                except Exception as e:
-                    logger.warning("Failed to read STT job %s from disk: %s", job_id, e)
             raise HTTPException(status_code=404, detail="STT job not found.")
         
         payload = {
