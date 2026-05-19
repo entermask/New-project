@@ -587,7 +587,7 @@ def parse_args() -> argparse.Namespace:
         default="round-robin",
         help="How requests are assigned to multiple reference audio URLs",
     )
-    parser.add_argument("--ref-text", default="", help="Optional reference transcript")
+    parser.add_argument("--ref-text", "--ref_text", default="", help="Optional reference transcript")
     parser.add_argument("--text", default="Xin chào, đây là benchmark OmniVoice.", help="Text for all requests")
     parser.add_argument("--text-file", default="", help="Optional file with one text per line")
     parser.add_argument("--text-repeat", type=int, default=1, help="Repeat each text N times to benchmark long TTS jobs")

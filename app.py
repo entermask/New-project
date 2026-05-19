@@ -22,6 +22,7 @@ import numpy as np
 import soundfile as sf
 from fastapi import BackgroundTasks
 from fastapi import Depends
+from fastapi import UploadFile, File, Form
 from fastapi import FastAPI
 from fastapi import Header
 from fastapi import HTTPException
@@ -97,7 +98,7 @@ voice_prompt_cache_guard = asyncio.Lock()
 class TTSRequest(BaseModel):
     chunks: list[str]
     ref_audio_url: str
-    ref_text: Optional[str] = None
+    ref_text: str
     language: Optional[str] = None
     num_step: int = 32
     speed: Optional[float] = None
@@ -120,6 +121,22 @@ class ChunkGenerationItem:
     voice_clone_prompt: object
     output_wav: Path
     future: asyncio.Future[str]
+
+
+@dataclass
+class STTJob:
+    job_id: str
+    status: str  # "queued", "running", "completed", "failed"
+    created_at: float
+    updated_at: float
+    result: Optional[dict] = None
+    error: Optional[str] = None
+    file_path: Optional[Path] = None
+
+
+stt_jobs: dict[str, STTJob] = {}
+stt_jobs_lock = asyncio.Lock()
+stt_gpu_semaphore = asyncio.Semaphore(1)
 
 
 @dataclass
@@ -261,17 +278,36 @@ async def _get_voice_clone_prompt(req: TTSRequest, ref: ReferenceCacheEntry) -> 
 
 async def _download_ref_audio(ref_audio_url: str, target: Path) -> None:
     tmp_target = target.with_suffix(f"{target.suffix}.tmp")
-    async with httpx.AsyncClient(follow_redirects=True, timeout=DOWNLOAD_TIMEOUT) as client:
-        async with client.stream("GET", ref_audio_url) as response:
-            if response.status_code >= 400:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Could not download ref_audio_url: HTTP {response.status_code}",
-                )
-            with tmp_target.open("wb") as handle:
-                async for chunk in response.aiter_bytes():
-                    handle.write(chunk)
-    tmp_target.replace(target)
+    last_exc = None
+    for attempt in range(1, 4):
+        try:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=DOWNLOAD_TIMEOUT) as client:
+                async with client.stream("GET", ref_audio_url) as response:
+                    if response.status_code >= 400:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Could not download ref_audio_url: HTTP {response.status_code}",
+                        )
+                    with tmp_target.open("wb") as handle:
+                        async for chunk in response.aiter_bytes():
+                            handle.write(chunk)
+            tmp_target.replace(target)
+            return
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(
+                "Attempt %d/3 to download ref audio failed: %s. Retrying in %ds...",
+                attempt,
+                exc,
+                attempt,
+            )
+            if attempt < 3:
+                await asyncio.sleep(attempt)
+    
+    raise HTTPException(
+        status_code=400,
+        detail=f"Could not download ref_audio_url after 3 attempts. Last error: {last_exc}",
+    )
 
 
 async def _resolve_reference(req: TTSRequest) -> ReferenceCacheEntry:
@@ -379,7 +415,6 @@ def _load_model() -> None:
             dtype=model_dtype,
         )
         runner.load_model()
-        runner.model.load_asr_model(model_name=ASR_MODEL_NAME)
         model_runner = runner
         model = runner.model
     else:
@@ -389,8 +424,7 @@ def _load_model() -> None:
             MODEL_NAME,
             device_map=DEVICE_MAP,
             dtype=_torch_dtype(torch, model_dtype),
-            load_asr=True,
-            asr_model_name=ASR_MODEL_NAME,
+            load_asr=False,
         )
     resolved_gpu_name = gpu_name
     resolved_gpu_profile = gpu_profile
@@ -835,11 +869,36 @@ async def _cleanup_expired_jobs() -> None:
         logger.info("Cleaned up %d expired TTS jobs.", len(expired))
 
 
+async def _cleanup_expired_stt_jobs() -> None:
+    if JOB_TTL_SECONDS <= 0:
+        return
+    now = time.time()
+    expired: list[STTJob] = []
+    async with stt_jobs_lock:
+        for job_id, job in list(stt_jobs.items()):
+            if job.status in {"queued", "running"}:
+                continue
+            if now - job.updated_at <= JOB_TTL_SECONDS:
+                continue
+            expired.append(job)
+            del stt_jobs[job_id]
+
+    for job in expired:
+        if job.file_path and job.file_path.exists():
+            try:
+                job.file_path.unlink()
+            except OSError as exc:
+                logger.warning("Could not delete expired STT file %s: %s", job.file_path, exc)
+    if expired:
+        logger.info("Cleaned up %d expired STT jobs.", len(expired))
+
+
 async def _periodic_job_cleanup() -> None:
     while True:
         await asyncio.sleep(JOB_CLEANUP_INTERVAL_SECONDS)
         try:
             await _cleanup_expired_jobs()
+            await _cleanup_expired_stt_jobs()
         except Exception:
             logger.exception("Error during periodic job cleanup")
 
@@ -906,6 +965,8 @@ def _validate_request(req: TTSRequest) -> None:
     if not req.chunks or not any(c.strip() for c in req.chunks):
         raise HTTPException(status_code=400, detail="chunks is required and must contain non-empty strings.")
     req.chunks = [c.strip() for c in req.chunks if c.strip()]
+    if not req.ref_text or not req.ref_text.strip():
+        raise HTTPException(status_code=400, detail="ref_text is required.")
     if not req.ref_audio_url or not req.ref_audio_url.strip():
         raise HTTPException(status_code=400, detail="ref_audio_url is required.")
     parsed = urlparse(req.ref_audio_url)
@@ -971,6 +1032,25 @@ async def health() -> dict[str, object]:
         "acceleration": ACCELERATION,
         **runtime_metrics,
     }
+
+
+@app.post("/v1/cache/clear")
+async def clear_cache(_: None = Depends(_validate_token)) -> dict:
+    import shutil
+    try:
+        if REF_AUDIO_DIR.exists():
+            shutil.rmtree(REF_AUDIO_DIR)
+            REF_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+        if TRANSCRIPT_DIR.exists():
+            shutil.rmtree(TRANSCRIPT_DIR)
+            TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+        async with voice_prompt_cache_guard:
+            voice_prompt_cache.clear()
+        logger.info("Cache cleared successfully via API.")
+        return {"status": "ok", "message": "All cached reference audios, transcripts, and memory prompts cleared successfully."}
+    except Exception as e:
+        logger.exception("Failed to clear cache.")
+        raise HTTPException(status_code=500, detail=f"Failed to clear cache: {e}")
 
 
 @app.post("/v1/tts")
@@ -1077,3 +1157,257 @@ async def get_tts_job_audio(
         media_type="application/octet-stream",
         headers=headers,
     )
+
+
+# ==============================================================================
+# SPEECH TO TEXT (STT) WHISPER LARGE V3
+# ==============================================================================
+
+whisper_model = None
+whisper_model_lock = asyncio.Lock()
+
+
+def _format_srt_timestamp(seconds: float) -> str:
+    millis = int((seconds - int(seconds)) * 1000)
+    mins, secs = divmod(int(seconds), 60)
+    hours, mins = divmod(mins, 60)
+    return f"{hours:02d}:{mins:02d}:{secs:02d},{millis:03d}"
+
+
+def _generate_srt(segments: list[dict]) -> str:
+    srt_lines = []
+    for i, seg in enumerate(segments, start=1):
+        start_str = _format_srt_timestamp(seg["start"])
+        end_str = _format_srt_timestamp(seg["end"])
+        srt_lines.append(f"{i}")
+        srt_lines.append(f"{start_str} --> {end_str}")
+        srt_lines.append(f"{seg['text'].strip()}")
+        srt_lines.append("")
+    return "\n".join(srt_lines)
+
+
+def _load_whisper_model() -> None:
+    global whisper_model
+    from faster_whisper import WhisperModel
+    gpu_index = _cuda_device_index()
+    logger.info("Loading Whisper model large-v3 on GPU %d...", gpu_index)
+    whisper_model = WhisperModel(
+        "large-v3",
+        device="cuda",
+        device_index=gpu_index,
+        compute_type="float16"
+    )
+    logger.info("Whisper model large-v3 loaded successfully.")
+
+
+async def _ensure_whisper_model() -> None:
+    global whisper_model
+    if whisper_model is not None:
+        return
+    async with whisper_model_lock:
+        if whisper_model is None:
+            await asyncio.to_thread(_load_whisper_model)
+
+
+async def _run_stt_job_async(job_id: str, file_path: Path, language: Optional[str], beam_size: int, vad_filter: bool, word_timestamps: bool) -> None:
+    async with stt_jobs_lock:
+        job = stt_jobs.get(job_id)
+        if job:
+            job.status = "running"
+            job.updated_at = time.time()
+
+    try:
+        await _ensure_whisper_model()
+        
+        def transcribe_fn():
+            segments_generator, info = whisper_model.transcribe(
+                str(file_path),
+                beam_size=beam_size,
+                language=language or None,
+                vad_filter=vad_filter,
+                word_timestamps=word_timestamps
+            )
+            segments_list = []
+            for segment in segments_generator:
+                seg_dict = {
+                    "start": segment.start,
+                    "end": segment.end,
+                    "text": segment.text
+                }
+                if segment.words:
+                    seg_dict["words"] = [
+                        {
+                            "start": w.start,
+                            "end": w.end,
+                            "word": w.word,
+                            "probability": w.probability
+                        }
+                        for w in segment.words
+                    ]
+                segments_list.append(seg_dict)
+            srt_content = _generate_srt(segments_list)
+            return {
+                "language": info.language,
+                "language_probability": info.language_probability,
+                "duration_seconds": info.duration,
+                "text": "".join([s["text"] for s in segments_list]).strip(),
+                "segments": segments_list,
+                "srt": srt_content
+            }
+
+        async with stt_gpu_semaphore:
+            result = await asyncio.to_thread(transcribe_fn)
+
+        async with stt_jobs_lock:
+            job = stt_jobs.get(job_id)
+            if job:
+                job.status = "completed"
+                job.result = result
+                job.updated_at = time.time()
+                
+    except Exception as exc:
+        logger.exception("Error during async STT job %s", job_id)
+        async with stt_jobs_lock:
+            job = stt_jobs.get(job_id)
+            if job:
+                job.status = "failed"
+                job.error = str(exc)
+                job.updated_at = time.time()
+
+
+async def _transcribe_sync(file_path: Path, language: Optional[str], beam_size: int, vad_filter: bool, word_timestamps: bool) -> dict:
+    await _ensure_whisper_model()
+    
+    def transcribe_fn():
+        segments_generator, info = whisper_model.transcribe(
+            str(file_path),
+            beam_size=beam_size,
+            language=language or None,
+            vad_filter=vad_filter,
+            word_timestamps=word_timestamps
+        )
+        segments_list = []
+        for segment in segments_generator:
+            seg_dict = {
+                "start": segment.start,
+                "end": segment.end,
+                "text": segment.text
+            }
+            if segment.words:
+                seg_dict["words"] = [
+                    {
+                        "start": w.start,
+                        "end": w.end,
+                        "word": w.word,
+                        "probability": w.probability
+                    }
+                    for w in segment.words
+                ]
+            segments_list.append(seg_dict)
+        srt_content = _generate_srt(segments_list)
+        return {
+            "status": "completed",
+            "language": info.language,
+            "language_probability": info.language_probability,
+            "duration_seconds": info.duration,
+            "text": "".join([s["text"] for s in segments_list]).strip(),
+            "segments": segments_list,
+            "srt": srt_content
+        }
+
+    async with stt_gpu_semaphore:
+        return await asyncio.to_thread(transcribe_fn)
+
+
+@app.post("/v1/stt/transcribe")
+async def transcribe_audio(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    language: Optional[str] = Form(None),
+    mode: str = Form("sync"),
+    beam_size: int = Form(5),
+    vad_filter: bool = Form(True),
+    word_timestamps: bool = Form(False),
+    _: None = Depends(_validate_token)
+) -> JSONResponse:
+    if mode not in {"sync", "async"}:
+        raise HTTPException(status_code=400, detail="mode must be 'sync' or 'async'.")
+    
+    job_id = f"stt_job_{uuid.uuid4().hex[:12]}"
+    stt_dir = TMP_DIR / "stt"
+    stt_dir.mkdir(parents=True, exist_ok=True)
+    temp_file_path = stt_dir / f"{job_id}{Path(file.filename or '.wav').suffix}"
+    
+    try:
+        import shutil
+        with temp_file_path.open("wb") as out_file:
+            shutil.copyfileobj(file.file, out_file)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to save uploaded file: {exc}")
+        
+    if mode == "sync":
+        try:
+            result = await _transcribe_sync(temp_file_path, language, beam_size, vad_filter, word_timestamps)
+            return JSONResponse(content=result)
+        except Exception as exc:
+            logger.exception("Error during sync transcription")
+            raise HTTPException(status_code=500, detail=str(exc))
+        finally:
+            if temp_file_path.exists():
+                try:
+                    temp_file_path.unlink()
+                except OSError:
+                    pass
+    else:
+        now = time.time()
+        job = STTJob(
+            job_id=job_id,
+            status="queued",
+            created_at=now,
+            updated_at=now,
+            file_path=temp_file_path
+        )
+        async with stt_jobs_lock:
+            stt_jobs[job_id] = job
+            
+        background_tasks.add_task(
+            _run_stt_job_async,
+            job_id,
+            temp_file_path,
+            language,
+            beam_size,
+            vad_filter,
+            word_timestamps
+        )
+        return JSONResponse(
+            status_code=202,
+            content={
+                "job_id": job_id,
+                "status": "queued",
+                "created_at": now
+            }
+        )
+
+
+@app.get("/v1/stt/status/{job_id}")
+async def get_stt_job_status(
+    job_id: str,
+    _: None = Depends(_validate_token)
+) -> JSONResponse:
+    async with stt_jobs_lock:
+        job = stt_jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="STT job not found.")
+        
+        payload = {
+            "job_id": job.job_id,
+            "status": job.status,
+            "created_at": job.created_at,
+            "updated_at": job.updated_at
+        }
+        if job.status == "completed":
+            payload["result"] = job.result
+        elif job.status == "failed":
+            payload["error"] = job.error
+            
+    return JSONResponse(content=payload)
