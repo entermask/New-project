@@ -609,7 +609,7 @@ async def run(args: argparse.Namespace) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark the OmniVoice /v1/tts API.")
-    parser.add_argument("--base-url", required=True, help="Base API URL, e.g. https://id-8080.thundercompute.net")
+    parser.add_argument("--base-url", required=True, help="Base API URL, e.g. https://id-8001.thundercompute.net")
     parser.add_argument("--token", required=True, help="Bearer API token")
     parser.add_argument(
         "--ref-audio-url",

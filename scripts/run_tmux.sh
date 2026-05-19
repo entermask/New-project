@@ -7,7 +7,7 @@ DEFAULT_APP_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 APP_DIR="${APP_DIR:-$DEFAULT_APP_DIR}"
 VENV_DIR="${VENV_DIR:-$HOME/venvs/omnivoice-api}"
 HOST="${HOST:-0.0.0.0}"
-PORT="${PORT:-8080}"
+PORT="${PORT:-8001}"
 RESTART="${RESTART:-1}"
 
 if ! command -v tmux >/dev/null 2>&1; then
@@ -31,16 +31,6 @@ if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
   else
     echo "tmux session '$SESSION_NAME' already exists. Attach with: tmux attach -t $SESSION_NAME"
     exit 0
-  fi
-fi
-
-# Kill any process currently occupying the port
-if command -v lsof >/dev/null 2>&1; then
-  PIDS=$(lsof -t -i :"$PORT" || true)
-  if [ -n "$PIDS" ]; then
-    echo "Port $PORT is in use. Killing process(es): $PIDS"
-    echo "$PIDS" | xargs kill -9 || true
-    sleep 1
   fi
 fi
 
