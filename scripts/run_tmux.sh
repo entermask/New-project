@@ -34,10 +34,27 @@ if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
   fi
 fi
 
+# Detect site-packages path inside VENV_DIR to auto-configure Nvidia CUDA library paths
+PYTHON_VERSION=$( "$VENV_DIR/bin/python" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "3.10" )
+SITE_PACKAGES="$VENV_DIR/lib/python$PYTHON_VERSION/site-packages"
+
+EXTRA_PATHS=""
+if [ -d "$SITE_PACKAGES/nvidia/cublas/lib" ]; then
+  EXTRA_PATHS="$SITE_PACKAGES/nvidia/cublas/lib"
+fi
+if [ -d "$SITE_PACKAGES/nvidia/cudnn/lib" ]; then
+  if [ -n "$EXTRA_PATHS" ]; then
+    EXTRA_PATHS="$EXTRA_PATHS:$SITE_PACKAGES/nvidia/cudnn/lib"
+  else
+    EXTRA_PATHS="$SITE_PACKAGES/nvidia/cudnn/lib"
+  fi
+fi
+
 tmux new-session -d -s "$SESSION_NAME" \
   "cd '$APP_DIR' && \
    source '$VENV_DIR/bin/activate' && \
    set -a && source .env && set +a && \
+   ${EXTRA_PATHS:+export LD_LIBRARY_PATH=\"\$LD_LIBRARY_PATH:$EXTRA_PATHS\" &&} \
    exec '$VENV_DIR/bin/uvicorn' app:app --host '$HOST' --port '$PORT'"
 
 echo "Started OmniVoice API in tmux session '$SESSION_NAME' on $HOST:$PORT"
