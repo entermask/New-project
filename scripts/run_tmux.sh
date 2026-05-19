@@ -34,6 +34,16 @@ if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
   fi
 fi
 
+# Kill any process currently occupying the port
+if command -v lsof >/dev/null 2>&1; then
+  PIDS=$(lsof -t -i :"$PORT" || true)
+  if [ -n "$PIDS" ]; then
+    echo "Port $PORT is in use. Killing process(es): $PIDS"
+    echo "$PIDS" | xargs kill -9 || true
+    sleep 1
+  fi
+fi
+
 # Detect site-packages path inside VENV_DIR to auto-configure Nvidia CUDA library paths
 PYTHON_VERSION=$( "$VENV_DIR/bin/python" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "3.10" )
 SITE_PACKAGES="$VENV_DIR/lib/python$PYTHON_VERSION/site-packages"
