@@ -58,5 +58,6 @@ tmux new-session -d -s "$SESSION_NAME" \
    exec '$VENV_DIR/bin/uvicorn' app:app --host '$HOST' --port '$PORT'"
 
 echo "Started OmniVoice API in tmux session '$SESSION_NAME' on $HOST:$PORT"
-echo "Attach logs: tmux attach -t $SESSION_NAME"
-echo "Detach: Ctrl+B then D"
+echo "Attaching to session '$SESSION_NAME' now... (Detach with Ctrl+B then D)"
+
+exec tmux attach-session -t "$SESSION_NAME"
