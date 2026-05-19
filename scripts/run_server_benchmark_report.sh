@@ -9,7 +9,7 @@ Required unless present in .env:
   API_TOKEN                    Bearer token for the API
 
 Common overrides:
-  BASE_URL                     Default: http://127.0.0.1:8001
+  BASE_URL                     Default: http://127.0.0.1:8080
   REF_AUDIO_URL                Default: German sample URL from Hailuo CDN
   REF_AUDIO_VARIANT_PARAM      Default: a
   REF_AUDIO_SELECTION          Default: round-robin. Options: round-robin, grouped
@@ -17,7 +17,7 @@ Common overrides:
   TEXT                         Text to synthesize
   LANGUAGE                     Default: de
   REQUESTS                     Default: 20
-  PORT                         Default: 8001
+  PORT                         Default: 8080
   APP_DIR                      Default: repo root
   VENV_DIR                     Default: $HOME/venvs/omnivoice-api
   REPORT_ROOT                  Default: APP_DIR/reports
@@ -56,7 +56,7 @@ DEFAULT_APP_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 
 APP_DIR="${APP_DIR:-$DEFAULT_APP_DIR}"
 VENV_DIR="${VENV_DIR:-$HOME/venvs/omnivoice-api}"
-PORT="${PORT:-8001}"
+PORT="${PORT:-8080}"
 BASE_URL="${BASE_URL:-http://127.0.0.1:$PORT}"
 REF_AUDIO_URL="${REF_AUDIO_URL:-https://cdn.hailuoai.video/moss/prod/2026-05-14-05/moss-audio/voice/u_2054676293873570458/demo/1778708587932629888-397944920203503_German.mp3}"
 REF_AUDIO_VARIANT_PARAM="${REF_AUDIO_VARIANT_PARAM:-a}"

@@ -167,7 +167,7 @@ Yêu cầu server xóa sạch toàn bộ các file âm thanh tham chiếu (`ref-
 ### 1. Dùng cURL (Command Line)
 **Chạy chế độ Sync:**
 ```bash
-curl -X POST "http://<IP_OR_DOMAIN>:8001/v1/stt/transcribe" \
+curl -X POST "http://<IP_OR_DOMAIN>:8080/v1/stt/transcribe" \
      -H "Authorization: Bearer <API_TOKEN>" \
      -F "file=@/path/to/your/audio.mp3" \
      -F "mode=sync" \
@@ -184,7 +184,7 @@ import axios from 'axios';
 import * as fs from 'fs';
 import * as FormData from 'form-data';
 
-const API_URL = 'http://localhost:8001';
+const API_URL = 'http://localhost:8080';
 const API_TOKEN = 'your-secret-token';
 
 async function transcribeAudio(filePath: string, language?: string) {
@@ -248,7 +248,7 @@ transcribeAudio('./demo.wav', 'vi').then((res) => {
 import requests
 import time
 
-API_URL = "http://localhost:8001"
+API_URL = "http://localhost:8080"
 API_TOKEN = "your-secret-token"
 
 def transcribe(file_path, language="vi"):

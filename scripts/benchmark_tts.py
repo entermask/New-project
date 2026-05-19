@@ -148,6 +148,27 @@ def summarize_by_ref_audio(results: list[Result]) -> list[dict[str, Any]]:
     return summaries
 
 
+def split_text_for_tts(text: str, target_chars: int = 200) -> list[str]:
+    import re
+    normalized = " ".join(text.split()).strip()
+    if not normalized:
+        return []
+    sentences = re.split(r"(?<=[.!?])\s+", normalized)
+    chunks = []
+    current = ""
+    for sentence in sentences:
+        if not current:
+            current = sentence
+        elif len(current) + 1 + len(sentence) <= target_chars:
+            current = f"{current} {sentence}"
+        else:
+            chunks.append(current)
+            current = sentence
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 def load_texts(args: argparse.Namespace) -> list[str]:
     if args.text_file:
         lines = [
@@ -391,15 +412,47 @@ async def run_one(
             audio_duration_ms = 0.0
             rtf = 0.0
             duration_error = ""
+            audio_to_save = body
             if ok:
-                audio_duration_ms, duration_error = probe_audio_duration_ms(body, payload["format"])
+                content_type = response.headers.get("Content-Type", "")
+                if "octet-stream" in content_type:
+                    import struct
+                    try:
+                        if len(body) >= 4:
+                            chunk_count = struct.unpack(">I", body[0:4])[0]
+                            offset = 4
+                            chunks_data = []
+                            for _ in range(chunk_count):
+                                if len(body) - offset < 4:
+                                    break
+                                size = struct.unpack(">I", body[offset:offset+4])[0]
+                                offset += 4
+                                if len(body) - offset < size:
+                                    break
+                                chunks_data.append(body[offset:offset+size])
+                                offset += size
+                            
+                            total_dur = 0.0
+                            for chunk_bytes in chunks_data:
+                                dur_ms, err = probe_audio_duration_ms(chunk_bytes, payload["format"])
+                                if dur_ms > 0:
+                                    total_dur += dur_ms
+                            audio_duration_ms = total_dur
+                            audio_to_save = b"".join(chunks_data)
+                    except Exception as e:
+                        duration_error = f"Failed to parse chunked audio: {e}"
+                        audio_to_save = body
+                else:
+                    audio_duration_ms, duration_error = probe_audio_duration_ms(body, payload["format"])
+                    audio_to_save = body
+
                 if audio_duration_ms > 0:
                     rtf = elapsed_ms / audio_duration_ms
 
             if ok and output_dir:
                 suffix = payload["format"]
                 output_dir.mkdir(parents=True, exist_ok=True)
-                (output_dir / f"{index:05d}.{suffix}").write_bytes(body)
+                (output_dir / f"{index:05d}.{suffix}").write_bytes(audio_to_save)
             return Result(
                 index=index,
                 text_index=text_index,
@@ -468,9 +521,10 @@ async def run(args: argparse.Namespace) -> int:
                 args.ref_audio_selection,
             )
             text = texts[text_index]
+            chunks = split_text_for_tts(text, args.chunk_size_chars)
             ref_audio_url = ref_audio_urls[ref_audio_index]
             payload = {
-                "text": text,
+                "chunks": chunks,
                 "ref_audio_url": ref_audio_url,
                 "num_step": args.num_step,
                 "format": args.format,
@@ -555,7 +609,7 @@ async def run(args: argparse.Namespace) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark the OmniVoice /v1/tts API.")
-    parser.add_argument("--base-url", required=True, help="Base API URL, e.g. https://id-8001.thundercompute.net")
+    parser.add_argument("--base-url", required=True, help="Base API URL, e.g. https://id-8080.thundercompute.net")
     parser.add_argument("--token", required=True, help="Bearer API token")
     parser.add_argument(
         "--ref-audio-url",

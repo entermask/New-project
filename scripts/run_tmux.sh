@@ -7,7 +7,7 @@ DEFAULT_APP_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 APP_DIR="${APP_DIR:-$DEFAULT_APP_DIR}"
 VENV_DIR="${VENV_DIR:-$HOME/venvs/omnivoice-api}"
 HOST="${HOST:-0.0.0.0}"
-PORT="${PORT:-8001}"
+PORT="${PORT:-8080}"
 RESTART="${RESTART:-1}"
 
 if ! command -v tmux >/dev/null 2>&1; then

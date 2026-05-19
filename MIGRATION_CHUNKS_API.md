@@ -158,7 +158,7 @@ async function parseChunkedAudio(response) {
 ### Full flow example
 
 ```javascript
-const BASE_URL = "http://your-server:8001";
+const BASE_URL = "http://your-server:8080";
 const TOKEN = "your-api-token";
 const headers = {
   "Authorization": `Bearer ${TOKEN}`,

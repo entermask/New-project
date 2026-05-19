@@ -2,7 +2,7 @@
 set -euo pipefail
 
 HOST="${HOST:-0.0.0.0}"
-PORT="${PORT:-8001}"
+PORT="${PORT:-8080}"
 VENV_DIR="${VENV_DIR:-$HOME/venvs/omnivoice-api}"
 
 if [ -x "$VENV_DIR/bin/uvicorn" ]; then

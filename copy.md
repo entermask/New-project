@@ -4,6 +4,10 @@ set -a
 source .env
 set +a
 
-uvicorn app:app --host 0.0.0.0 --port 8001
+uvicorn app:app --host 0.0.0.0 --port 8080
+
+
+source ~/venvs/omnivoice-api/bin/activate
+pip install -r requirements.txt
 
 docker exec -it supabase_db_supabase psql -U postgres -c "ALTER USER postgres WITH PASSWORD 'postgres';"

@@ -283,7 +283,7 @@ ALLOW_DEADSNAKES_PPA=0 ./scripts/install_thunder.sh
 ENABLE_UFW=1 ./scripts/install_thunder.sh
 
 # Custom app/SSH ports for UFW rules
-APP_PORT=8001 SSH_PORT=22 ./scripts/install_thunder.sh
+APP_PORT=8080 SSH_PORT=22 ./scripts/install_thunder.sh
 ```
 
 If the script installs an NVIDIA driver, restart/reboot the instance before expecting `nvidia-smi` to work.
@@ -292,7 +292,7 @@ The install script adds UFW allow rules for SSH and the app port. By default it 
 
 ```bash
 sudo ufw allow ssh
-sudo ufw allow 8001/tcp
+sudo ufw allow 8080/tcp
 sudo ufw enable
 sudo ufw status verbose
 ```
@@ -311,13 +311,13 @@ source ~/venvs/omnivoice-api/bin/activate
 set -a
 source .env
 set +a
-uvicorn app:app --host 0.0.0.0 --port 8001
+uvicorn app:app --host 0.0.0.0 --port 8080
 ```
 
 Expose through Thunder:
 
 ```bash
-tnr ports forward 0 --add 8001
+tnr ports forward 0 --add 8080
 ```
 
 ## Run With tmux
@@ -366,7 +366,7 @@ source ~/venvs/omnivoice-api/bin/activate
 set -a
 source .env
 set +a
-uvicorn app:app --host 0.0.0.0 --port 8001
+uvicorn app:app --host 0.0.0.0 --port 8080
 ```
 
 Detach while leaving the API running:
@@ -399,13 +399,13 @@ exit
 Expose the port:
 
 ```bash
-tnr ports forward 0 --add 8001
+tnr ports forward 0 --add 8080
 ```
 
 Health check:
 
 ```bash
-curl http://127.0.0.1:8001/health
+curl http://127.0.0.1:8080/health
 ```
 
 ## systemd Optional
@@ -445,7 +445,7 @@ Run from your local machine or from Thunder:
 
 ```bash
 python scripts/benchmark_tts.py \
-  --base-url "https://<instance-uuid>-8001.thundercompute.net" \
+  --base-url "https://<instance-uuid>-8080.thundercompute.net" \
   --token "change-me" \
   --ref-audio-url "https://example.com/ref.wav" \
   --ref-audio-variants 1 \
