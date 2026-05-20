@@ -104,7 +104,6 @@ class TTSRequest(BaseModel):
     speed: Optional[float] = None
     guidance_scale: float = 2.0
     format: str = "wav"
-    instruct: Optional[str] = None
 
 
 @dataclass
@@ -450,8 +449,6 @@ def _generation_kwargs(texts: list[str], reqs: list[TTSRequest], voice_clone_pro
     }
     if any(req.speed is not None for req in reqs):
         kwargs["speed"] = [req.speed for req in reqs]
-    if any(req.instruct for req in reqs):
-        kwargs["instruct"] = reqs[0].instruct
     return kwargs
 
 
@@ -477,10 +474,11 @@ def _generate_wav_batch(items: list[ChunkGenerationItem]) -> list[str]:
         raise RuntimeError("OmniVoice model is not loaded.")
 
     logger.info(
-        "Chunk batch generate: items=%d jobs=%d num_step=%d",
+        "Chunk batch generate: items=%d jobs=%d num_step=%d guidance_scale=%.2f",
         len(items),
         len({item.request_id for item in items}),
         items[0].req.num_step,
+        items[0].req.guidance_scale,
     )
 
     gen_start = time.monotonic()

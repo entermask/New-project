@@ -12,4 +12,7 @@ pip install -r requirements.txt
 
 git clone https://github.com/entermask/New-project.git && cd ./New-project && ./scripts/install.sh
 
+
+git pull && RESTART=1 ./scripts/run_tmux.sh
+
 docker exec -it supabase_db_supabase psql -U postgres -c "ALTER USER postgres WITH PASSWORD 'postgres';"
