@@ -6,6 +6,14 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_APP_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 APP_DIR="${APP_DIR:-$DEFAULT_APP_DIR}"
 VENV_DIR="${VENV_DIR:-$HOME/venvs/omnivoice-api}"
+
+# Load .env if it exists to allow setting PORT, HOST, etc.
+if [ -f "$APP_DIR/.env" ]; then
+  set -a
+  source "$APP_DIR/.env"
+  set +a
+fi
+
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8001}"
 RESTART="${RESTART:-1}"
