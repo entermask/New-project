@@ -142,7 +142,7 @@ fi
 
 if [ "$IS_5090" = "1" ]; then
   echo "Detected RTX 5090 / Blackwell GPU. Installing PyTorch with CUDA 12.8 support..."
-  python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+  python -m pip install -U --force-reinstall torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 else
   echo "Standard GPU detected. Installing PyTorch 2.5.1 with CUDA 12.1 support..."
   python -m pip install torch==2.5.1+cu121 torchaudio==2.5.1+cu121 torchvision==0.20.1+cu121 --index-url https://download.pytorch.org/whl/cu121
