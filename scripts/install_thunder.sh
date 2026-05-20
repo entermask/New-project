@@ -130,6 +130,24 @@ echo "Using Python: $("$PYTHON" --version) at $PYTHON"
 source "$VENV_DIR/bin/activate"
 
 python -m pip install -U pip wheel
+
+# Detect GPU type
+IS_5090=0
+if command -v nvidia-smi >/dev/null 2>&1; then
+  GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || true)
+  if echo "$GPU_NAME" | grep -qiE "5090|blackwell"; then
+    IS_5090=1
+  fi
+fi
+
+if [ "$IS_5090" = "1" ]; then
+  echo "Detected RTX 5090 / Blackwell GPU. Installing PyTorch with CUDA 12.8 support..."
+  python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+else
+  echo "Standard GPU detected. Installing PyTorch 2.5.1 with CUDA 12.1 support..."
+  python -m pip install torch==2.5.1+cu121 torchaudio==2.5.1+cu121 torchvision==0.20.1+cu121 --index-url https://download.pytorch.org/whl/cu121
+fi
+
 python -m pip install -r requirements.txt
 python -m pip install git+https://github.com/entermask/omnivoice-triton.git --no-deps
 
