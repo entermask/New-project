@@ -102,6 +102,7 @@ class TTSRequest(BaseModel):
     language: Optional[str] = None
     num_step: int = 32
     speed: Optional[float] = None
+    guidance_scale: float = 2.0
     format: str = "wav"
 
 
@@ -444,6 +445,7 @@ def _generation_kwargs(texts: list[str], reqs: list[TTSRequest], voice_clone_pro
         "language": [req.language or None for req in reqs],
         "voice_clone_prompt": voice_clone_prompts,
         "num_step": reqs[0].num_step,
+        "guidance_scale": reqs[0].guidance_scale,
     }
     if any(req.speed is not None for req in reqs):
         kwargs["speed"] = [req.speed for req in reqs]
@@ -512,23 +514,48 @@ def _write_silent_test_wav(output_path: Path) -> str:
 def _convert_wav_to_mp3(wav_path: Path, mp3_path: Path) -> None:
     if shutil.which("ffmpeg") is None:
         raise RuntimeError("ffmpeg is required for format=mp3 but was not found.")
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-i",
-            str(wav_path),
-            "-codec:a",
-            "libmp3lame",
-            "-b:a",
-            "128k",
-            str(mp3_path),
-        ],
-        check=True,
-    )
+    if not wav_path.exists() or wav_path.stat().st_size == 0:
+        raise RuntimeError(f"WAV file is missing or empty: {wav_path}")
+
+    retry_timeouts = [60, 120, 180]  # 1m -> 2m -> 3m
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(wav_path),
+        "-codec:a",
+        "libmp3lame",
+        "-b:a",
+        "128k",
+        str(mp3_path),
+    ]
+
+    for attempt, timeout_s in enumerate(retry_timeouts, 1):
+        try:
+            subprocess.run(cmd, check=True, timeout=timeout_s)
+            return
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "ffmpeg WAV->MP3 timed out after %ds (attempt %d/%d): %s",
+                timeout_s,
+                attempt,
+                len(retry_timeouts),
+                wav_path,
+            )
+            # Clean up partial output before retry
+            if mp3_path.exists():
+                try:
+                    mp3_path.unlink()
+                except OSError:
+                    pass
+            if attempt >= len(retry_timeouts):
+                raise RuntimeError(
+                    f"ffmpeg WAV->MP3 conversion timed out after {len(retry_timeouts)} "
+                    f"attempts (last timeout: {timeout_s}s): {wav_path}"
+                )
 
 
 async def _metric_delta(name: str, delta: int) -> None:
@@ -604,23 +631,24 @@ async def _try_reserve_generation_chunks(count: int) -> tuple[bool, int]:
         return True, outstanding_chunks
 
 
-def _batch_generation_key(item: ChunkGenerationItem) -> tuple[int, Optional[float], Optional[str]]:
+def _batch_generation_key(item: ChunkGenerationItem) -> tuple[int, Optional[float], Optional[float], Optional[str]]:
     return (
         item.req.num_step,
         item.req.speed,
+        item.req.guidance_scale,
         item.req.language,
     )
 
 
 def _group_batch_items(items: list[ChunkGenerationItem]) -> list[list[ChunkGenerationItem]]:
-    groups: dict[tuple[int, Optional[float], Optional[str]], list[ChunkGenerationItem]] = {}
+    groups: dict[tuple[int, Optional[float], Optional[float], Optional[str]], list[ChunkGenerationItem]] = {}
     for item in items:
         groups.setdefault(_batch_generation_key(item), []).append(item)
     return list(groups.values())
 
 
 def _take_deferred_generation_item(
-    key: Optional[tuple[int, Optional[float], Optional[str]]] = None,
+    key: Optional[tuple[int, Optional[float], Optional[float], Optional[str]]] = None,
 ) -> Optional[ChunkGenerationItem]:
     if not deferred_generation_items:
         return None
@@ -976,6 +1004,8 @@ def _validate_request(req: TTSRequest) -> None:
         raise HTTPException(status_code=400, detail="num_step must be between 4 and 64.")
     if req.speed is not None and (req.speed < 0.5 or req.speed > 2.0):
         raise HTTPException(status_code=400, detail="speed must be between 0.5 and 2.0.")
+    if req.guidance_scale is not None and (req.guidance_scale < 0.0 or req.guidance_scale > 4.0):
+        raise HTTPException(status_code=400, detail="guidance_scale must be between 0.0 and 4.0.")
 
 
 @app.on_event("startup")

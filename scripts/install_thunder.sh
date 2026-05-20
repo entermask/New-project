@@ -137,4 +137,4 @@ cp .env.example .env
 
 echo "Installed OmniVoice API dependencies in $VENV_DIR"
 echo "Installed system packages: ffmpeg tmux curl ca-certificates lsb-release build-essential gcc g++ ufw"
-echo "Run service with: ./scripts/run_tmux.sh"
+exec ./scripts/run_tmux.sh
