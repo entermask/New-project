@@ -1,20 +1,33 @@
 #!/usr/bin/env bash
-# Script to automate setting up the systemd service for running OmniVoice in tmux on boot
-
+# This script sets up a systemd service that automatically launches the
+# OmniVoice API inside a tmux session on system boot or reboot.
 set -euo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-APP_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 SERVICE_NAME="omnivoice-tmux"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+APP_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 
+# Ensure the script is run as root
 if [ "$EUID" -ne 0 ]; then
-  echo "Error: This script must be run as root (or with sudo)." >&2
+  echo "Please run this script as root (sudo)." >&2
   exit 1
 fi
 
-echo "Creating Systemd service file at ${SERVICE_FILE}..."
+# Ensure tmux is installed
+if ! command -v tmux >/dev/null 2>&1; then
+  echo "tmux is not installed! Installing tmux..."
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update && apt-get install -y tmux
+  else
+    echo "Could not find apt-get. Please install tmux manually." >&2
+    exit 1
+  fi
+fi
 
+TMUX_PATH="$(command -v tmux)"
+
+echo "Creating systemd service file at ${SERVICE_FILE}..."
 cat <<EOF > "${SERVICE_FILE}"
 [Unit]
 Description=OmniVoice Tmux Service
@@ -25,7 +38,7 @@ Type=forking
 User=root
 WorkingDirectory=${APP_DIR}
 ExecStart=${APP_DIR}/scripts/run_tmux.sh
-ExecStop=/usr/bin/tmux kill-session -t omnivoice
+ExecStop=${TMUX_PATH} kill-session -t omnivoice
 Restart=on-failure
 RemainAfterExit=yes
 
@@ -36,12 +49,14 @@ EOF
 echo "Reloading systemd daemon..."
 systemctl daemon-reload
 
-echo "Enabling ${SERVICE_NAME}.service to run on boot..."
+echo "Enabling ${SERVICE_NAME}.service to run on system boot..."
 systemctl enable "${SERVICE_NAME}.service"
 
-echo "Starting ${SERVICE_NAME}.service now..."
-systemctl start "${SERVICE_NAME}.service"
+echo "Starting ${SERVICE_NAME}.service..."
+systemctl restart "${SERVICE_NAME}.service"
 
-echo "Systemd service setup complete!"
-echo "You can check the status with: systemctl status ${SERVICE_NAME}.service"
-echo "You can attach to the tmux session with: tmux a"
+echo "--------------------------------------------------------"
+echo "OmniVoice Tmux Service successfully configured and started!"
+echo "Check the service status: systemctl status ${SERVICE_NAME}"
+echo "Attach to the running tmux session: tmux attach -t omnivoice"
+echo "--------------------------------------------------------"
