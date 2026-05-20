@@ -4,7 +4,7 @@ set -a
 source .env
 set +a
 
-uvicorn app:app --host 0.0.0.0 --port 8001
+uvicorn app:app --host 0.0.0.0 --port 3006
 
 
 source ~/venvs/omnivoice-api/bin/activate

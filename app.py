@@ -104,6 +104,7 @@ class TTSRequest(BaseModel):
     speed: Optional[float] = None
     guidance_scale: float = 2.0
     format: str = "wav"
+    instruct: Optional[str] = None
 
 
 @dataclass
@@ -449,6 +450,8 @@ def _generation_kwargs(texts: list[str], reqs: list[TTSRequest], voice_clone_pro
     }
     if any(req.speed is not None for req in reqs):
         kwargs["speed"] = [req.speed for req in reqs]
+    if any(req.instruct for req in reqs):
+        kwargs["instruct"] = reqs[0].instruct
     return kwargs
 
 
@@ -1022,6 +1025,8 @@ async def startup() -> None:
     )
     job_cleanup_task = asyncio.create_task(_periodic_job_cleanup())
     logger.info("Periodic job cleanup started (interval=%ds).", JOB_CLEANUP_INTERVAL_SECONDS)
+    await asyncio.to_thread(_load_whisper_model)
+    logger.info("Whisper STT model preloaded at startup.")
 
 
 @app.on_event("shutdown")
