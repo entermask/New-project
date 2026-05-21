@@ -78,7 +78,8 @@ resolved_gpu_profile: Optional[str] = None
 resolved_model_dtype: Optional[str] = None
 generation_queue: asyncio.Queue["ChunkGenerationItem"] = asyncio.Queue()
 generation_batch_worker_task: Optional[asyncio.Task] = None
-gpu_generation_semaphore = asyncio.Semaphore(1)
+gpu_inference_semaphore = asyncio.Semaphore(1)
+gpu_generation_semaphore = gpu_inference_semaphore
 deferred_generation_items: deque["ChunkGenerationItem"] = deque()
 job_cleanup_task: Optional[asyncio.Task] = None
 active_requests = 0
@@ -137,7 +138,7 @@ class STTJob:
 
 stt_jobs: dict[str, STTJob] = {}
 stt_jobs_lock = asyncio.Lock()
-stt_gpu_semaphore = asyncio.Semaphore(1)
+stt_gpu_semaphore = gpu_inference_semaphore
 
 
 @dataclass
