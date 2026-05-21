@@ -268,7 +268,10 @@ async def _get_voice_clone_prompt(req: TTSRequest, ref: ReferenceCacheEntry) -> 
                 return cached
 
         async with gpu_generation_semaphore:
-            prompt = await asyncio.to_thread(_create_voice_clone_prompt, req, ref)
+            prompt = await _run_gpu_operation_with_oom_retry(
+                "voice clone prompt",
+                lambda: asyncio.to_thread(_create_voice_clone_prompt, req, ref),
+            )
 
         async with voice_prompt_cache_guard:
             voice_prompt_cache[cache_key] = prompt
@@ -374,6 +377,66 @@ def _resolve_model_dtype() -> str:
 
 def _torch_dtype(torch_module: object, dtype_name: str) -> object:
     return torch_module.float16
+
+
+def _clear_cuda_cache(context: str) -> None:
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return
+        gpu_index = _cuda_device_index()
+        if gpu_index >= torch.cuda.device_count():
+            return
+
+        with torch.cuda.device(gpu_index):
+            free_before, total = torch.cuda.mem_get_info()
+            torch.cuda.empty_cache()
+            free_after, _ = torch.cuda.mem_get_info()
+
+        logger.info(
+            "CUDA cache cleared after %s: free %.2f GiB -> %.2f GiB / %.2f GiB",
+            context,
+            free_before / 1024**3,
+            free_after / 1024**3,
+            total / 1024**3,
+        )
+    except Exception as exc:
+        logger.warning("Could not clear CUDA cache after %s: %s", context, exc)
+
+
+def _is_cuda_oom_error(exc: Exception) -> bool:
+    try:
+        import torch
+
+        if isinstance(exc, torch.cuda.OutOfMemoryError):
+            return True
+    except Exception:
+        pass
+
+    message = str(exc).lower()
+    return (
+        "cuda out of memory" in message
+        or "outofmemoryerror" in message
+        or "tried to allocate" in message
+    )
+
+
+async def _run_gpu_operation_with_oom_retry(context: str, operation):
+    for attempt in range(2):
+        try:
+            return await operation()
+        except Exception as exc:
+            if not _is_cuda_oom_error(exc) or attempt == 1:
+                raise
+            logger.warning(
+                "CUDA OOM during %s; clearing cache and retrying once: %s",
+                context,
+                exc,
+            )
+            _clear_cuda_cache(f"{context} OOM")
+
+    raise RuntimeError(f"{context} failed after OOM retry.")
 
 
 def _load_model() -> None:
@@ -737,7 +800,10 @@ async def _run_generation_batch(items: list[ChunkGenerationItem]) -> None:
             transcripts = ["" for _ in live_items]
         else:
             async with gpu_generation_semaphore:
-                transcripts = await asyncio.to_thread(_generate_wav_batch, live_items)
+                transcripts = await _run_gpu_operation_with_oom_retry(
+                    "TTS batch",
+                    lambda: asyncio.to_thread(_generate_wav_batch, live_items),
+                )
         if len(transcripts) != len(live_items):
             raise RuntimeError(
                 f"Batch generated {len(transcripts)} outputs for {len(live_items)} requests."
@@ -1251,8 +1317,6 @@ async def _run_stt_job_async(job_id: str, file_path: Path, language: Optional[st
             job.updated_at = time.time()
 
     try:
-        await _ensure_whisper_model()
-        
         def transcribe_fn():
             segments_generator, info = whisper_model.transcribe(
                 str(file_path),
@@ -1290,7 +1354,11 @@ async def _run_stt_job_async(job_id: str, file_path: Path, language: Optional[st
             }
 
         async with stt_gpu_semaphore:
-            result = await asyncio.to_thread(transcribe_fn)
+            async def run_async_stt():
+                await _ensure_whisper_model()
+                return await asyncio.to_thread(transcribe_fn)
+
+            result = await _run_gpu_operation_with_oom_retry("async STT", run_async_stt)
 
         async with stt_jobs_lock:
             job = stt_jobs.get(job_id)
@@ -1310,8 +1378,6 @@ async def _run_stt_job_async(job_id: str, file_path: Path, language: Optional[st
 
 
 async def _transcribe_sync(file_path: Path, language: Optional[str], beam_size: int, vad_filter: bool, word_timestamps: bool) -> dict:
-    await _ensure_whisper_model()
-    
     def transcribe_fn():
         segments_generator, info = whisper_model.transcribe(
             str(file_path),
@@ -1350,7 +1416,11 @@ async def _transcribe_sync(file_path: Path, language: Optional[str], beam_size: 
         }
 
     async with stt_gpu_semaphore:
-        return await asyncio.to_thread(transcribe_fn)
+        async def run_sync_stt():
+            await _ensure_whisper_model()
+            return await asyncio.to_thread(transcribe_fn)
+
+        return await _run_gpu_operation_with_oom_retry("sync STT", run_sync_stt)
 
 
 @app.post("/v1/stt/transcribe")
