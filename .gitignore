@@ -12,3 +12,6 @@ build/
 tmp/
 *.wav
 *.mp3
+.DS_Store
+results/
+benchmarks/

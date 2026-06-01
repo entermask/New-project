@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VENV_DIR="${VENV_DIR:-$HOME/venvs/omnivoice-tts}"
+if [ -z "${VENV_DIR:-}" ] && [ -d "$HOME/autodl-tmp" ] && [ -w "$HOME/autodl-tmp" ]; then
+  VENV_DIR="$HOME/autodl-tmp/venvs/omnivoice-tts"
+else
+  VENV_DIR="${VENV_DIR:-$HOME/venvs/omnivoice-tts}"
+fi
 APP_PORT="${APP_PORT:-6006}"
 INSTALL_NVIDIA_DRIVER="${INSTALL_NVIDIA_DRIVER:-auto}"
 NVIDIA_DRIVER_VERSION="${NVIDIA_DRIVER_VERSION:-}"
@@ -121,6 +125,12 @@ python -m pip install git+https://github.com/entermask/omnivoice-triton.git --no
 
 if [ ! -f .env ]; then
   cp .env.tts.example .env
+fi
+
+if [ -d "$HOME/autodl-tmp" ] && [ -w "$HOME/autodl-tmp" ]; then
+  mkdir -p "$HOME/autodl-tmp/huggingface-cache" "$HOME/autodl-tmp/omnivoice-cache"
+  sed -i "s|^HF_HOME=.*|HF_HOME=$HOME/autodl-tmp/huggingface-cache|" .env
+  sed -i "s|^OMNIVOICE_CACHE_DIR=.*|OMNIVOICE_CACHE_DIR=$HOME/autodl-tmp/omnivoice-cache|" .env
 fi
 
 echo "Installed OmniVoice TTS API dependencies in $VENV_DIR"
