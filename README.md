@@ -1,6 +1,45 @@
 # OmniVoice API
 
-Standalone FastAPI wrapper for [OmniVoice](https://github.com/k2-fsa/OmniVoice), intended to run on a Thunder Compute GPU instance and serve an existing TTS queue through a single `/v1/tts` endpoint.
+Standalone FastAPI wrappers for [OmniVoice](https://github.com/k2-fsa/OmniVoice) TTS and Qwen3-ASR STT. The repo now ships two independent servers intended to run on separate RTX 5090 machines; both default to port `6006` because they are deployed separately.
+
+## Server Entrypoints
+
+TTS:
+
+```bash
+cp .env.tts.example .env
+./scripts/install_tts.sh
+# or after install:
+./scripts/run_tts.sh
+```
+
+STT:
+
+```bash
+cp .env.stt.example .env
+./scripts/install_stt.sh
+# or after install:
+./scripts/run_stt.sh
+```
+
+Legacy `uvicorn app:app` remains a TTS compatibility shim. Use `uvicorn omnivoice_api.stt.server:app --host 0.0.0.0 --port 6006` for STT.
+
+## Qwen3-ASR STT
+
+The STT server keeps the existing `/v1/stt/transcribe` and `/v1/stt/status/{job_id}` contract, but adds an optional multipart form field `model` with values `0.6b` or `1.7b`. If omitted, `QWEN_ASR_DEFAULT_MODEL=0.6b` is used. Startup loads both `Qwen/Qwen3-ASR-0.6B` and `Qwen/Qwen3-ASR-1.7B` unless `QWEN_ASR_SKIP_MODEL_LOAD=1`.
+
+On the benchmarked RTX 5090 host with driver `570.169`, stable `qwen-asr[vllm]` works when vLLM is forced away from FlashAttention: `QWEN_ASR_VLLM_ATTENTION_BACKEND=TRITON_ATTN` and `QWEN_ASR_VLLM_MM_ENCODER_ATTN_BACKEND=TORCH_SDPA`. Because startup loads both 0.6B and 1.7B, the default `QWEN_ASR_GPU_MEMORY_UTILIZATION` is `0.35` per vLLM engine. The measured sweet spot for 30s audio is `QWEN_ASR_MAX_INFERENCE_BATCH_SIZE=32`; batch 64/96/128 runs without OOM in single-model direct benchmarks, but p95 latency jumps and throughput is less stable. The STT worker batches queued requests per model and reduces the dynamic batch size on CUDA OOM before retrying.
+
+Run the RTX 5090 benchmark after the STT server is up:
+
+```bash
+python scripts/benchmark_stt_qwen.py \
+  --base-url http://127.0.0.1:6006 \
+  --token "$API_TOKEN" \
+  --audio short.wav medium.wav long.wav
+```
+
+Benchmark JSON and Markdown reports are written to `benchmarks/stt-qwen3-5090/`.
 
 ## API
 
@@ -37,7 +76,7 @@ Returns model, GPU, chunk scheduler, and cache status.
     "succeeded": 20,
     "failed": 0
   },
-  "acceleration": "base"
+  "acceleration": "triton"
 }
 ```
 
@@ -87,6 +126,7 @@ Response:
   "created_at": 1778730000.0,
   "updated_at": 1778730000.0,
   "status_url": "/v1/tts/jobs/f5a4e...",
+  "language": "vi",
   "input_chars": 840,
   "chunks_total": 5,
   "chunks_completed": 0,
@@ -136,6 +176,8 @@ X-Transcript: <url-encoded-transcript>
 X-Transcript-Encoding: urlencoded-utf8
 ```
 
+Audio files are streamed in bounded blocks instead of reading whole chunks into memory. Tune block size with `OMNIVOICE_STREAM_CHUNK_SIZE_BYTES`, default `1048576`.
+
 See `MIGRATION_CHUNKS_API.md` for full client integration guide with Node.js examples.
 
 Completed job metadata and audio files are kept for `OMNIVOICE_JOB_TTL_SECONDS`, default `3600`.
@@ -181,6 +223,14 @@ Client is responsible for splitting text into chunks before submitting. See `MIG
 
 `OMNIVOICE_BATCH_SIZE` is the maximum number of chunks sent to one `model.generate(...)` call. Compatible chunks are grouped by `num_step`, `speed`, and `language`.
 
+## TTS Language Handling
+
+The TTS service runs the official `k2-fsa/OmniVoice` checkpoint directly. It does not load language-specific finetunes, auto-detect request text, or switch models per batch.
+
+Explicit request `language` values are still normalized before generation. `zh`, `cmn`, and Mandarin-oriented `zh-*` aliases map to OmniVoice `zh`; explicit Cantonese aliases such as `yue` and `zh-hk` map to OmniVoice `yue`. `fr`, `fra`, and common `fr-*` aliases map to OmniVoice `fr`. `ar`, `ara`, and common `ar-*` aliases map to OmniVoice `arb`; explicit Arabic dialect IDs from `languages.md` such as `ars`, `ary`, `arz`, `afb`, and `apc` are preserved.
+
+If `language` is omitted or set to `auto`, the server passes no language override to OmniVoice.
+
 `OMNIVOICE_BUSY_BACKLOG_CHUNKS` is the admission gate. New requests are accepted while queued+running chunks are below this value. Once the backlog reaches the limit, new submissions return `429 Too Many Requests` with `Retry-After: 1`. Accepted jobs are not rejected internally; they run to `succeeded` or `failed`.
 
 `OMNIVOICE_BATCH_MAX_WAIT_MS` is only a short wait to let a partial batch fill with nearby traffic. It is not a public request queue.
@@ -217,7 +267,7 @@ triton
 hybrid
 ```
 
-`base` is the official OmniVoice path and is the default. `triton` uses `omnivoice-triton` kernel fusion without CUDA Graph capture, so it is the safer optimized mode to test with chunk batching. `hybrid` uses CUDA Graph + Triton and should stay experimental; start with a small `OMNIVOICE_BATCH_SIZE`.
+`triton` is the default TTS runtime. `base` is the official OmniVoice path for fallback/comparison. `triton` uses `omnivoice-triton` kernel fusion without CUDA Graph capture, so it is the safer optimized mode to test with chunk batching. `hybrid` uses CUDA Graph + Triton and should stay experimental; start with a small `OMNIVOICE_BATCH_SIZE`.
 
 Recommended testing order:
 
@@ -500,7 +550,7 @@ python scripts/benchmark_tts.py --base-url "$BASE_URL" --token "$API_TOKEN" --re
 python scripts/benchmark_tts.py --base-url "$BASE_URL" --token "$API_TOKEN" --ref-audio-url "$REF_AUDIO_URL" --requests 20 --concurrency 4 --format mp3
 ```
 
-The server-side matrix defaults to `base` acceleration and now includes both short and long logical TTS jobs. Set `MATRIX_ACCELERATIONS="base triton"` only when you explicitly want to compare Triton. The matrix value named `MATRIX_CONCURRENCIES` is kept for compatibility with old reports; it now sets both benchmark client concurrency and `OMNIVOICE_BATCH_SIZE`.
+The server-side matrix defaults to `triton` acceleration and includes both short and long logical TTS jobs. Set `MATRIX_ACCELERATIONS="base triton"` when you explicitly want to compare base vs Triton. The matrix value named `MATRIX_CONCURRENCIES` is kept for compatibility with old reports; it now sets both benchmark client concurrency and `OMNIVOICE_BATCH_SIZE`.
 
 ```text
 MATRIX_TEXT_REPEATS="1 20"

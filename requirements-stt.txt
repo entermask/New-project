@@ -1,0 +1,2 @@
+-r requirements-common.txt
+qwen-asr[vllm]>=0.0.6

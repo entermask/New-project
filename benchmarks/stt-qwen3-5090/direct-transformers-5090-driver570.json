@@ -1,0 +1,52 @@
+{
+  "host": {
+    "gpu": "NVIDIA GeForce RTX 5090",
+    "vram_mib": 32607,
+    "driver": "570.169"
+  },
+  "backend": {
+    "name": "transformers",
+    "torch": "2.9.1+cu128",
+    "dtype": "bfloat16",
+    "attention": "sdpa",
+    "max_new_tokens": 256
+  },
+  "vllm_status": {
+    "stable": "failed during audio encoder FlashAttention/PTX profiling",
+    "nightly": "failed: CUDA driver version is insufficient for CUDA runtime version"
+  },
+  "sweetspot": {
+    "max_inference_batch_size": 32,
+    "reason": "Best mixed-duration tradeoff. 0.6B peaks at 32 for 30s audio; 1.7B batch 64 is only slightly faster for 30s but worse for 10s and uses much more VRAM."
+  },
+  "cases": [
+    {"model":"0.6b","seconds":10,"batch":1,"throughput_audio_s_per_s":20.84,"avg_s":0.480,"p95_s":0.767,"used_vram_gb":2.39},
+    {"model":"0.6b","seconds":10,"batch":2,"throughput_audio_s_per_s":63.48,"avg_s":0.315,"p95_s":0.338,"used_vram_gb":2.41},
+    {"model":"0.6b","seconds":10,"batch":4,"throughput_audio_s_per_s":106.73,"avg_s":0.375,"p95_s":0.388,"used_vram_gb":2.41},
+    {"model":"0.6b","seconds":10,"batch":8,"throughput_audio_s_per_s":143.36,"avg_s":0.558,"p95_s":0.572,"used_vram_gb":2.74},
+    {"model":"0.6b","seconds":10,"batch":16,"throughput_audio_s_per_s":219.60,"avg_s":0.729,"p95_s":0.859,"used_vram_gb":3.42},
+    {"model":"0.6b","seconds":10,"batch":32,"throughput_audio_s_per_s":187.91,"avg_s":1.703,"p95_s":1.800,"used_vram_gb":4.76},
+    {"model":"0.6b","seconds":10,"batch":64,"throughput_audio_s_per_s":231.41,"avg_s":2.766,"p95_s":3.210,"used_vram_gb":7.44},
+    {"model":"0.6b","seconds":30,"batch":1,"throughput_audio_s_per_s":110.70,"avg_s":0.271,"p95_s":0.299,"used_vram_gb":7.47},
+    {"model":"0.6b","seconds":30,"batch":2,"throughput_audio_s_per_s":189.64,"avg_s":0.316,"p95_s":0.340,"used_vram_gb":7.47},
+    {"model":"0.6b","seconds":30,"batch":4,"throughput_audio_s_per_s":184.64,"avg_s":0.650,"p95_s":0.696,"used_vram_gb":7.47},
+    {"model":"0.6b","seconds":30,"batch":8,"throughput_audio_s_per_s":230.48,"avg_s":1.041,"p95_s":1.076,"used_vram_gb":7.47},
+    {"model":"0.6b","seconds":30,"batch":16,"throughput_audio_s_per_s":261.63,"avg_s":1.835,"p95_s":1.971,"used_vram_gb":7.47},
+    {"model":"0.6b","seconds":30,"batch":32,"throughput_audio_s_per_s":324.67,"avg_s":2.957,"p95_s":3.031,"used_vram_gb":11.16},
+    {"model":"0.6b","seconds":30,"batch":64,"throughput_audio_s_per_s":304.81,"avg_s":6.299,"p95_s":6.759,"used_vram_gb":18.55},
+    {"model":"1.7b","seconds":10,"batch":1,"throughput_audio_s_per_s":19.73,"avg_s":0.507,"p95_s":0.540,"used_vram_gb":5.04},
+    {"model":"1.7b","seconds":10,"batch":2,"throughput_audio_s_per_s":50.39,"avg_s":0.397,"p95_s":0.412,"used_vram_gb":5.06},
+    {"model":"1.7b","seconds":10,"batch":4,"throughput_audio_s_per_s":83.93,"avg_s":0.477,"p95_s":0.494,"used_vram_gb":5.06},
+    {"model":"1.7b","seconds":10,"batch":8,"throughput_audio_s_per_s":122.41,"avg_s":0.654,"p95_s":0.684,"used_vram_gb":5.06},
+    {"model":"1.7b","seconds":10,"batch":16,"throughput_audio_s_per_s":142.07,"avg_s":1.126,"p95_s":1.186,"used_vram_gb":5.73},
+    {"model":"1.7b","seconds":10,"batch":32,"throughput_audio_s_per_s":196.96,"avg_s":1.625,"p95_s":1.962,"used_vram_gb":7.07},
+    {"model":"1.7b","seconds":10,"batch":64,"throughput_audio_s_per_s":162.32,"avg_s":3.943,"p95_s":4.232,"used_vram_gb":9.75},
+    {"model":"1.7b","seconds":30,"batch":1,"throughput_audio_s_per_s":74.28,"avg_s":0.404,"p95_s":0.408,"used_vram_gb":9.77},
+    {"model":"1.7b","seconds":30,"batch":2,"throughput_audio_s_per_s":103.40,"avg_s":0.580,"p95_s":0.629,"used_vram_gb":9.77},
+    {"model":"1.7b","seconds":30,"batch":4,"throughput_audio_s_per_s":160.35,"avg_s":0.748,"p95_s":0.766,"used_vram_gb":9.77},
+    {"model":"1.7b","seconds":30,"batch":8,"throughput_audio_s_per_s":215.19,"avg_s":1.115,"p95_s":1.361,"used_vram_gb":9.77},
+    {"model":"1.7b","seconds":30,"batch":16,"throughput_audio_s_per_s":307.41,"avg_s":1.561,"p95_s":1.768,"used_vram_gb":9.77},
+    {"model":"1.7b","seconds":30,"batch":32,"throughput_audio_s_per_s":304.28,"avg_s":3.155,"p95_s":3.349,"used_vram_gb":13.47},
+    {"model":"1.7b","seconds":30,"batch":64,"throughput_audio_s_per_s":310.97,"avg_s":6.174,"p95_s":6.582,"used_vram_gb":20.86}
+  ]
+}
