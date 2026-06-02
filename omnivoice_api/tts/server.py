@@ -744,7 +744,7 @@ async def _try_reserve_generation_chunks(count: int) -> tuple[bool, int]:
     global queued_generations
     async with metrics_lock:
         outstanding_chunks = queued_generations + active_generations
-        if outstanding_chunks > 0 and outstanding_chunks + count > BUSY_BACKLOG_CHUNKS:
+        if outstanding_chunks >= BUSY_BACKLOG_CHUNKS:
             return False, outstanding_chunks
         queued_generations += count
         return True, outstanding_chunks
