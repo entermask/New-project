@@ -744,7 +744,7 @@ async def _try_reserve_generation_chunks(count: int) -> tuple[bool, int]:
     global queued_generations
     async with metrics_lock:
         outstanding_chunks = queued_generations + active_generations
-        if outstanding_chunks >= BUSY_BACKLOG_CHUNKS:
+        if outstanding_chunks + count > BUSY_BACKLOG_CHUNKS:
             return False, outstanding_chunks
         queued_generations += count
         return True, outstanding_chunks
@@ -1200,12 +1200,14 @@ async def tts(
             status_code=429,
             detail=(
                 "TTS chunk backlog is busy; retry later. "
-                f"outstanding_chunks={outstanding_chunks}, limit={BUSY_BACKLOG_CHUNKS}."
+                f"outstanding_chunks={outstanding_chunks}, requested_chunks={len(chunks)}, "
+                f"limit={BUSY_BACKLOG_CHUNKS}."
             ),
             headers={
                 "Retry-After": "1",
                 "X-Busy-Backlog-Chunks": str(BUSY_BACKLOG_CHUNKS),
                 "X-Outstanding-Chunks": str(outstanding_chunks),
+                "X-Requested-Chunks": str(len(chunks)),
             },
         )
 

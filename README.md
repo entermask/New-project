@@ -233,7 +233,7 @@ Explicit request `language` values are still normalized before generation. `zh`,
 
 If `language` is omitted or set to `auto`, the server passes no language override to OmniVoice.
 
-`OMNIVOICE_BUSY_BACKLOG_CHUNKS` is the admission gate. New requests are accepted while queued+running chunks are below this value. Once the backlog reaches the limit, new submissions return `429 Too Many Requests` with `Retry-After: 1`. Accepted jobs are not rejected internally; they run to `succeeded` or `failed`.
+`OMNIVOICE_BUSY_BACKLOG_CHUNKS` is the admission gate. New requests are accepted only when queued+running chunks plus the new request's chunk count fit within this value. Requests that would exceed the limit return `429 Too Many Requests` with `Retry-After: 1`. Accepted jobs are not rejected internally; they run to `succeeded` or `failed`.
 
 `OMNIVOICE_BATCH_MAX_WAIT_MS` is only a short wait to let a partial batch fill with nearby traffic. It is not a public request queue.
 
