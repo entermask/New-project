@@ -13,6 +13,8 @@ cp .env.tts.example .env
 ./scripts/run_tts.sh
 ```
 
+On GPUHub/AutoDL hosts, keep `HF_HOME`, `OMNIVOICE_CACHE_DIR`, and `TMPDIR` under `$HOME/autodl-tmp` so model weights, reference-audio cache, job audio, and temp files use the data disk instead of the small system disk.
+
 STT:
 
 ```bash

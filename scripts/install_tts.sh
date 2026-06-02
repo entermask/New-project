@@ -128,9 +128,14 @@ if [ ! -f .env ]; then
 fi
 
 if [ -d "$HOME/autodl-tmp" ] && [ -w "$HOME/autodl-tmp" ]; then
-  mkdir -p "$HOME/autodl-tmp/huggingface-cache" "$HOME/autodl-tmp/omnivoice-cache"
-  sed -i "s|^HF_HOME=.*|HF_HOME=$HOME/autodl-tmp/huggingface-cache|" .env
+  mkdir -p "$HOME/autodl-tmp/cache/huggingface" "$HOME/autodl-tmp/omnivoice-cache" "$HOME/autodl-tmp/tmp"
+  sed -i "s|^HF_HOME=.*|HF_HOME=$HOME/autodl-tmp/cache/huggingface|" .env
   sed -i "s|^OMNIVOICE_CACHE_DIR=.*|OMNIVOICE_CACHE_DIR=$HOME/autodl-tmp/omnivoice-cache|" .env
+  if grep -q "^TMPDIR=" .env; then
+    sed -i "s|^TMPDIR=.*|TMPDIR=$HOME/autodl-tmp/tmp|" .env
+  else
+    printf "\nTMPDIR=%s/autodl-tmp/tmp\n" "$HOME" >> .env
+  fi
 fi
 
 echo "Installed OmniVoice TTS API dependencies in $VENV_DIR"
