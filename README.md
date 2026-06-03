@@ -269,11 +269,12 @@ If `ref_text` is provided, it is used and written to transcript cache. If `ref_t
 
 ## Chunked TTS Scheduler
 
-`/v1/tts` and `/v1/tts/kokoro` both create one logical TTS job from caller-provided chunks. OmniVoice creates one `voice_clone_prompt` for the job and generates compatible chunks in GPU batches. Kokoro runs chunk generation through its own async worker path with `KOKORO_CONCURRENCY`.
+`/v1/tts` and `/v1/tts/kokoro` both create one logical TTS job from caller-provided chunks. OmniVoice creates one `voice_clone_prompt` for the job and generates compatible chunks in GPU batches. Kokoro uses its own async worker path with `KOKORO_CONCURRENCY`; keep Kokoro at concurrency `1` because its shared misaki/phonemizer pipeline is not safe under concurrent calls.
 
 ```text
 OMNIVOICE_BATCH_SIZE=12
 OMNIVOICE_BUSY_BACKLOG_CHUNKS=24
+KOKORO_CONCURRENCY=1
 KOKORO_BUSY_BACKLOG_CHUNKS=24
 OMNIVOICE_BATCH_MAX_WAIT_MS=50
 OMNIVOICE_JOB_TTL_SECONDS=3600

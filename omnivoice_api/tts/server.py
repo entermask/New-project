@@ -54,7 +54,7 @@ MODEL_DTYPE = os.getenv("OMNIVOICE_DTYPE", "fp16").lower().strip()
 ACCELERATION = os.getenv("OMNIVOICE_ACCELERATION", "base").lower().strip()
 KOKORO_MODEL_NAME = os.getenv("KOKORO_MODEL", "hexgrad/Kokoro-82M")
 KOKORO_DEVICE = os.getenv("KOKORO_DEVICE", DEVICE_MAP)
-KOKORO_CONCURRENCY = max(1, int(os.getenv("KOKORO_CONCURRENCY", "12")))
+KOKORO_CONCURRENCY = max(1, int(os.getenv("KOKORO_CONCURRENCY", "1")))
 KOKORO_PRELOAD = os.getenv("KOKORO_PRELOAD", "1") == "1"
 KOKORO_PRELOAD_LANGUAGES = os.getenv("KOKORO_PRELOAD_LANGUAGES", "a,b,e,f,h,i,j,p,z")
 KOKORO_WARMUP = os.getenv("KOKORO_WARMUP", "1") == "1"
