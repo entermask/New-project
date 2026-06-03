@@ -90,6 +90,7 @@ kokoro_model_loaded = False
 kokoro_pipelines: dict[str, object] = {}
 kokoro_load_error: Optional[str] = None
 kokoro_load_lock = threading.RLock()
+kokoro_pipeline_call_lock = threading.RLock()
 resolved_gpu_name: Optional[str] = None
 resolved_gpu_profile: Optional[str] = None
 resolved_model_dtype: Optional[str] = None
@@ -806,10 +807,11 @@ def _warmup_kokoro_pipeline(lang_code: str) -> None:
     text = KOKORO_WARMUP_TEXTS[lang_code]
     logger.info("Kokoro warmup start: lang_code=%s voice=%s", lang_code, voice)
     started = time.monotonic()
-    with torch.inference_mode():
-        list(pipeline(text, voice=voice, speed=1.0, split_pattern=None))
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
+    with kokoro_pipeline_call_lock:
+        with torch.inference_mode():
+            list(pipeline(text, voice=voice, speed=1.0, split_pattern=None))
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
     logger.info(
         "Kokoro warmup done: lang_code=%s voice=%s elapsed=%.1fms",
         lang_code,
@@ -833,10 +835,11 @@ def _generate_kokoro_wav(text: str, req: KokoroTTSRequest, output_wav: Path) -> 
         len(text),
     )
     gen_start = time.monotonic()
-    with torch.inference_mode():
-        outputs = list(pipeline(text, voice=voice, speed=speed, split_pattern=None))
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
+    with kokoro_pipeline_call_lock:
+        with torch.inference_mode():
+            outputs = list(pipeline(text, voice=voice, speed=speed, split_pattern=None))
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
     parts = [_kokoro_audio_to_array(output.audio) for output in outputs]
     if not parts:
         raise RuntimeError("Kokoro returned no audio.")
