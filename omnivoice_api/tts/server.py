@@ -63,6 +63,10 @@ KOKORO_SAMPLE_RATE = 24000
 BATCH_SIZE = max(1, int(os.getenv("OMNIVOICE_BATCH_SIZE", "12")))
 BATCH_MAX_WAIT_MS = max(0.0, float(os.getenv("OMNIVOICE_BATCH_MAX_WAIT_MS", "100")))
 BUSY_BACKLOG_CHUNKS = max(1, int(os.getenv("OMNIVOICE_BUSY_BACKLOG_CHUNKS", str(BATCH_SIZE * 2))))
+KOKORO_BUSY_BACKLOG_CHUNKS = max(
+    1,
+    int(os.getenv("KOKORO_BUSY_BACKLOG_CHUNKS", str(BUSY_BACKLOG_CHUNKS))),
+)
 PROMPT_CACHE_SIZE = max(1, int(os.getenv("OMNIVOICE_PROMPT_CACHE_SIZE", "64")))
 JOB_CLEANUP_INTERVAL_SECONDS = 60
 STREAM_CHUNK_SIZE_BYTES = max(16 * 1024, int(os.getenv("OMNIVOICE_STREAM_CHUNK_SIZE_BYTES", str(1024 * 1024))))
@@ -97,9 +101,10 @@ kokoro_generation_semaphore = asyncio.Semaphore(KOKORO_CONCURRENCY)
 deferred_generation_items: deque["ChunkGenerationItem"] = deque()
 job_cleanup_task: Optional[asyncio.Task] = None
 active_requests = 0
-active_generations = 0
-active_generation_batches = 0
-queued_generations = 0
+GENERATION_PROVIDERS = ("omnivoice", "kokoro")
+active_generations_by_provider = {provider: 0 for provider in GENERATION_PROVIDERS}
+active_generation_batches_by_provider = {provider: 0 for provider in GENERATION_PROVIDERS}
+queued_generations_by_provider = {provider: 0 for provider in GENERATION_PROVIDERS}
 metrics_lock = asyncio.Lock()
 cache_locks: dict[str, asyncio.Lock] = {}
 cache_locks_guard = asyncio.Lock()
@@ -893,17 +898,30 @@ def _convert_wav_to_mp3(wav_path: Path, mp3_path: Path) -> None:
                 )
 
 
-async def _metric_delta(name: str, delta: int) -> None:
-    global active_requests, active_generations, active_generation_batches, queued_generations
+def _validate_generation_provider(provider: str) -> str:
+    if provider not in GENERATION_PROVIDERS:
+        raise ValueError(f"Unknown generation provider: {provider}")
+    return provider
+
+
+def _generation_backlog_limit(provider: str) -> int:
+    provider = _validate_generation_provider(provider)
+    if provider == "kokoro":
+        return KOKORO_BUSY_BACKLOG_CHUNKS
+    return BUSY_BACKLOG_CHUNKS
+
+
+async def _metric_delta(name: str, delta: int, provider: str = "omnivoice") -> None:
+    global active_requests
     async with metrics_lock:
         if name == "active_requests":
             active_requests += delta
         elif name == "active_generations":
-            active_generations += delta
+            active_generations_by_provider[_validate_generation_provider(provider)] += delta
         elif name == "active_generation_batches":
-            active_generation_batches += delta
+            active_generation_batches_by_provider[_validate_generation_provider(provider)] += delta
         elif name == "queued_generations":
-            queued_generations += delta
+            queued_generations_by_provider[_validate_generation_provider(provider)] += delta
         else:
             raise ValueError(f"Unknown metric: {name}")
 
@@ -912,16 +930,16 @@ async def _request_delta(delta: int) -> None:
     await _metric_delta("active_requests", delta)
 
 
-async def _active_generation_delta(delta: int) -> None:
-    await _metric_delta("active_generations", delta)
+async def _active_generation_delta(delta: int, provider: str = "omnivoice") -> None:
+    await _metric_delta("active_generations", delta, provider)
 
 
-async def _active_generation_batch_delta(delta: int) -> None:
-    await _metric_delta("active_generation_batches", delta)
+async def _active_generation_batch_delta(delta: int, provider: str = "omnivoice") -> None:
+    await _metric_delta("active_generation_batches", delta, provider)
 
 
-async def _queued_generation_delta(delta: int) -> None:
-    await _metric_delta("queued_generations", delta)
+async def _queued_generation_delta(delta: int, provider: str = "omnivoice") -> None:
+    await _metric_delta("queued_generations", delta, provider)
 
 
 async def _get_runtime_metrics() -> dict[str, object]:
@@ -942,6 +960,22 @@ async def _get_runtime_metrics() -> dict[str, object]:
         active_tts_jobs = job_counts["queued"] + job_counts["running"]
 
     async with metrics_lock:
+        generation_backlog_by_provider = {}
+        for provider in GENERATION_PROVIDERS:
+            queued = queued_generations_by_provider[provider]
+            running = active_generations_by_provider[provider]
+            active_batches = active_generation_batches_by_provider[provider]
+            generation_backlog_by_provider[provider] = {
+                "queued_chunks": queued,
+                "running_chunks": running,
+                "outstanding_chunks": queued + running,
+                "active_generation_batches": active_batches,
+                "busy_backlog_chunks": _generation_backlog_limit(provider),
+            }
+
+        queued_generations = sum(queued_generations_by_provider.values())
+        active_generations = sum(active_generations_by_provider.values())
+        active_generation_batches = sum(active_generation_batches_by_provider.values())
         outstanding_chunks = queued_generations + active_generations
         return {
             "active_requests": active_requests,
@@ -957,6 +991,8 @@ async def _get_runtime_metrics() -> dict[str, object]:
             "batch_size": BATCH_SIZE,
             "batch_max_wait_ms": BATCH_MAX_WAIT_MS,
             "busy_backlog_chunks": BUSY_BACKLOG_CHUNKS,
+            "kokoro_busy_backlog_chunks": KOKORO_BUSY_BACKLOG_CHUNKS,
+            "generation_backlog_by_provider": generation_backlog_by_provider,
             "voice_clone_prompt_cache_size": len(voice_prompt_cache),
             "voice_clone_prompt_cache_max_size": PROMPT_CACHE_SIZE,
             "tts_jobs": job_counts,
@@ -964,14 +1000,18 @@ async def _get_runtime_metrics() -> dict[str, object]:
         }
 
 
-async def _try_reserve_generation_chunks(count: int) -> tuple[bool, int]:
-    global queued_generations
+async def _try_reserve_generation_chunks(count: int, provider: str = "omnivoice") -> tuple[bool, int, int]:
+    provider = _validate_generation_provider(provider)
     async with metrics_lock:
-        outstanding_chunks = queued_generations + active_generations
-        if outstanding_chunks >= BUSY_BACKLOG_CHUNKS:
-            return False, outstanding_chunks
-        queued_generations += count
-        return True, outstanding_chunks
+        outstanding_chunks = (
+            queued_generations_by_provider[provider]
+            + active_generations_by_provider[provider]
+        )
+        limit = _generation_backlog_limit(provider)
+        if outstanding_chunks >= limit:
+            return False, outstanding_chunks, limit
+        queued_generations_by_provider[provider] += count
+        return True, outstanding_chunks, limit
 
 
 def _batch_generation_key(
@@ -1190,9 +1230,9 @@ async def _generate_kokoro_chunk_audio(
     output_wav: Path,
 ) -> Path:
     async with kokoro_generation_semaphore:
-        await _queued_generation_delta(-1)
-        await _active_generation_batch_delta(1)
-        await _active_generation_delta(1)
+        await _queued_generation_delta(-1, "kokoro")
+        await _active_generation_batch_delta(1, "kokoro")
+        await _active_generation_delta(1, "kokoro")
         try:
             if SKIP_MODEL_LOAD:
                 await asyncio.to_thread(_write_silent_test_wav, output_wav)
@@ -1207,8 +1247,8 @@ async def _generate_kokoro_chunk_audio(
             await _increment_job_chunks(request_id, failed=1)
             raise
         finally:
-            await _active_generation_delta(-1)
-            await _active_generation_batch_delta(-1)
+            await _active_generation_delta(-1, "kokoro")
+            await _active_generation_batch_delta(-1, "kokoro")
 
 
 async def _generate_kokoro_per_chunk_audio(
@@ -1434,7 +1474,7 @@ async def _run_kokoro_tts_job(request_id: str, req: KokoroTTSRequest) -> None:
     except Exception as exc:
         unfinished = await _fail_unfinished_job_chunks(request_id)
         if unfinished:
-            await _queued_generation_delta(-unfinished)
+            await _queued_generation_delta(-unfinished, "kokoro")
         _remove_files(cleanup_paths)
         await _set_job_state(
             request_id,
@@ -1508,10 +1548,11 @@ async def startup() -> None:
                 await asyncio.to_thread(_get_kokoro_pipeline, lang_code)
     generation_batch_worker_task = asyncio.create_task(_generation_batch_worker())
     logger.info(
-        "OmniVoice chunk scheduler started: batch_size=%s max_wait_ms=%s busy_backlog_chunks=%s.",
+        "OmniVoice chunk scheduler started: batch_size=%s max_wait_ms=%s busy_backlog_chunks=%s kokoro_busy_backlog_chunks=%s.",
         BATCH_SIZE,
         BATCH_MAX_WAIT_MS,
         BUSY_BACKLOG_CHUNKS,
+        KOKORO_BUSY_BACKLOG_CHUNKS,
     )
     job_cleanup_task = asyncio.create_task(_periodic_job_cleanup())
     logger.info("Periodic job cleanup started (interval=%ds).", JOB_CLEANUP_INTERVAL_SECONDS)
@@ -1594,18 +1635,21 @@ async def tts(
     _validate_request(req)
     chunks = req.chunks
 
-    reserved, outstanding_chunks = await _try_reserve_generation_chunks(len(chunks))
+    reserved, outstanding_chunks, backlog_limit = await _try_reserve_generation_chunks(
+        len(chunks),
+        "omnivoice",
+    )
     if not reserved:
         raise HTTPException(
             status_code=429,
             detail=(
                 "TTS chunk backlog is busy; retry later. "
                 f"outstanding_chunks={outstanding_chunks}, requested_chunks={len(chunks)}, "
-                f"limit={BUSY_BACKLOG_CHUNKS}."
+                f"limit={backlog_limit}."
             ),
             headers={
                 "Retry-After": "1",
-                "X-Busy-Backlog-Chunks": str(BUSY_BACKLOG_CHUNKS),
+                "X-Busy-Backlog-Chunks": str(backlog_limit),
                 "X-Outstanding-Chunks": str(outstanding_chunks),
                 "X-Requested-Chunks": str(len(chunks)),
             },
@@ -1646,18 +1690,21 @@ async def kokoro_tts(
     _validate_kokoro_request(req)
     chunks = req.chunks
 
-    reserved, outstanding_chunks = await _try_reserve_generation_chunks(len(chunks))
+    reserved, outstanding_chunks, backlog_limit = await _try_reserve_generation_chunks(
+        len(chunks),
+        "kokoro",
+    )
     if not reserved:
         raise HTTPException(
             status_code=429,
             detail=(
                 "TTS chunk backlog is busy; retry later. "
                 f"outstanding_chunks={outstanding_chunks}, requested_chunks={len(chunks)}, "
-                f"limit={BUSY_BACKLOG_CHUNKS}."
+                f"limit={backlog_limit}."
             ),
             headers={
                 "Retry-After": "1",
-                "X-Busy-Backlog-Chunks": str(BUSY_BACKLOG_CHUNKS),
+                "X-Busy-Backlog-Chunks": str(backlog_limit),
                 "X-Outstanding-Chunks": str(outstanding_chunks),
                 "X-Requested-Chunks": str(len(chunks)),
             },

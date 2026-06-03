@@ -13,7 +13,7 @@ cp .env.tts.example .env
 ./scripts/run_tts.sh
 ```
 
-On GPUHub/AutoDL hosts, keep `HF_HOME`, `OMNIVOICE_CACHE_DIR`, and `TMPDIR` under `$HOME/autodl-tmp` so model weights, reference-audio cache, job audio, and temp files use the data disk instead of the small system disk.
+On GPUHub hosts, keep heavy model cache on the system disk with `HF_HOME=$HOME/.cache/huggingface`, and keep generated reference-audio cache, job audio, and temp files on the data disk with `OMNIVOICE_CACHE_DIR` and `TMPDIR` under `$HOME/autodl-tmp`.
 
 STT:
 
@@ -274,6 +274,7 @@ If `ref_text` is provided, it is used and written to transcript cache. If `ref_t
 ```text
 OMNIVOICE_BATCH_SIZE=12
 OMNIVOICE_BUSY_BACKLOG_CHUNKS=24
+KOKORO_BUSY_BACKLOG_CHUNKS=24
 OMNIVOICE_BATCH_MAX_WAIT_MS=50
 OMNIVOICE_JOB_TTL_SECONDS=3600
 ```
@@ -290,7 +291,7 @@ Explicit request `language` values are still normalized before generation. `zh`,
 
 If `language` is omitted or set to `auto`, the server passes no language override to OmniVoice.
 
-`OMNIVOICE_BUSY_BACKLOG_CHUNKS` is the admission gate. New requests are accepted only when queued+running chunks plus the new request's chunk count fit within this value. Requests that would exceed the limit return `429 Too Many Requests` with `Retry-After: 1`. Accepted jobs are not rejected internally; they run to `succeeded` or `failed`.
+`OMNIVOICE_BUSY_BACKLOG_CHUNKS` is the OmniVoice admission gate. `KOKORO_BUSY_BACKLOG_CHUNKS` is the separate Kokoro admission gate. New requests return `429 Too Many Requests` with `Retry-After: 1` only when the same provider's queued+running chunks are already at its limit, so an OmniVoice backlog does not block `/v1/tts/kokoro`, and Kokoro backlog does not block `/v1/tts`. Accepted jobs are not rejected internally; they run to `succeeded` or `failed`.
 
 `OMNIVOICE_BATCH_MAX_WAIT_MS` is only a short wait to let a partial batch fill with nearby traffic. It is not a public request queue.
 

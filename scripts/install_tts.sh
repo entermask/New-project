@@ -129,13 +129,16 @@ if [ ! -f .env ]; then
 fi
 
 if [ -d "$HOME/autodl-tmp" ] && [ -w "$HOME/autodl-tmp" ]; then
-  mkdir -p "$HOME/autodl-tmp/cache/huggingface" "$HOME/autodl-tmp/omnivoice-cache" "$HOME/autodl-tmp/tmp"
-  sed -i "s|^HF_HOME=.*|HF_HOME=$HOME/autodl-tmp/cache/huggingface|" .env
+  mkdir -p "$HOME/.cache/huggingface" "$HOME/autodl-tmp/omnivoice-cache" "$HOME/autodl-tmp/tmp"
+  sed -i "s|^HF_HOME=.*|HF_HOME=$HOME/.cache/huggingface|" .env
   sed -i "s|^OMNIVOICE_CACHE_DIR=.*|OMNIVOICE_CACHE_DIR=$HOME/autodl-tmp/omnivoice-cache|" .env
   if grep -q "^TMPDIR=" .env; then
     sed -i "s|^TMPDIR=.*|TMPDIR=$HOME/autodl-tmp/tmp|" .env
   else
     printf "\nTMPDIR=%s/autodl-tmp/tmp\n" "$HOME" >> .env
+  fi
+  if ! grep -q "^KOKORO_BUSY_BACKLOG_CHUNKS=" .env; then
+    printf "KOKORO_BUSY_BACKLOG_CHUNKS=%s\n" "${KOKORO_BUSY_BACKLOG_CHUNKS:-72}" >> .env
   fi
 fi
 
