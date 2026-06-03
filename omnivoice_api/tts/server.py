@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 from collections import OrderedDict
@@ -51,6 +52,13 @@ SKIP_MODEL_LOAD = os.getenv("OMNIVOICE_SKIP_MODEL_LOAD", "0") == "1"
 GPU_PROFILE = os.getenv("OMNIVOICE_GPU_PROFILE", "auto").lower().strip()
 MODEL_DTYPE = os.getenv("OMNIVOICE_DTYPE", "fp16").lower().strip()
 ACCELERATION = os.getenv("OMNIVOICE_ACCELERATION", "base").lower().strip()
+KOKORO_MODEL_NAME = os.getenv("KOKORO_MODEL", "hexgrad/Kokoro-82M")
+KOKORO_DEVICE = os.getenv("KOKORO_DEVICE", DEVICE_MAP)
+KOKORO_CONCURRENCY = max(1, int(os.getenv("KOKORO_CONCURRENCY", "12")))
+KOKORO_PRELOAD = os.getenv("KOKORO_PRELOAD", "1") == "1"
+KOKORO_PRELOAD_LANGUAGES = os.getenv("KOKORO_PRELOAD_LANGUAGES", "a,b,e,f,h,i,j,p,z")
+KOKORO_WARMUP = os.getenv("KOKORO_WARMUP", "1") == "1"
+KOKORO_SAMPLE_RATE = 24000
 
 BATCH_SIZE = max(1, int(os.getenv("OMNIVOICE_BATCH_SIZE", "12")))
 BATCH_MAX_WAIT_MS = max(0.0, float(os.getenv("OMNIVOICE_BATCH_MAX_WAIT_MS", "100")))
@@ -73,6 +81,11 @@ app = FastAPI(title="OmniVoice TTS API", version="1.0.0")
 model = None
 model_runner = None
 model_loaded = False
+kokoro_model = None
+kokoro_model_loaded = False
+kokoro_pipelines: dict[str, object] = {}
+kokoro_load_error: Optional[str] = None
+kokoro_load_lock = threading.RLock()
 resolved_gpu_name: Optional[str] = None
 resolved_gpu_profile: Optional[str] = None
 resolved_model_dtype: Optional[str] = None
@@ -80,6 +93,7 @@ generation_queue: asyncio.Queue["ChunkGenerationItem"] = asyncio.Queue()
 generation_batch_worker_task: Optional[asyncio.Task] = None
 gpu_inference_semaphore = asyncio.Semaphore(1)
 gpu_generation_semaphore = gpu_inference_semaphore
+kokoro_generation_semaphore = asyncio.Semaphore(KOKORO_CONCURRENCY)
 deferred_generation_items: deque["ChunkGenerationItem"] = deque()
 job_cleanup_task: Optional[asyncio.Task] = None
 active_requests = 0
@@ -104,6 +118,15 @@ class TTSRequest(BaseModel):
     num_step: int = 32
     speed: Optional[float] = None
     guidance_scale: float = 2.0
+    format: str = "wav"
+
+
+class KokoroTTSRequest(BaseModel):
+    chunks: list[str]
+    language: Optional[str] = None
+    lang_code: Optional[str] = None
+    voice: Optional[str] = None
+    speed: Optional[float] = None
     format: str = "wav"
 
 
@@ -133,7 +156,9 @@ class TTSJob:
     created_at: float
     updated_at: float
     format: str
+    provider: str = "omnivoice"
     language: Optional[str] = None
+    voice: Optional[str] = None
     detail: Optional[str] = None
     chunk_paths: Optional[list[Path]] = None
     chunk_media_type: Optional[str] = None
@@ -241,6 +266,76 @@ ARABIC_LANGUAGE_IDS = {
     "aeb",
     "shu",
 }
+KOKORO_DEFAULT_VOICES = {
+    "a": "af_heart",
+    "b": "bf_emma",
+    "e": "ef_dora",
+    "f": "ff_siwis",
+    "h": "hf_alpha",
+    "i": "if_sara",
+    "j": "jf_alpha",
+    "p": "pf_dora",
+    "z": "zf_xiaobei",
+}
+KOKORO_WARMUP_TEXTS = {
+    "a": "Hello from Kokoro.",
+    "b": "Hello from Kokoro.",
+    "e": "Hola desde Kokoro.",
+    "f": "Bonjour depuis Kokoro.",
+    "h": "\u0928\u092e\u0938\u094d\u0924\u0947\u0964",
+    "i": "Ciao da Kokoro.",
+    "j": "\u3053\u3093\u306b\u3061\u306f\u3002",
+    "p": "Ola do Kokoro.",
+    "z": "\u4f60\u597d\u3002",
+}
+KOKORO_LANGUAGE_ALIASES = {
+    "a": "a",
+    "b": "b",
+    "e": "e",
+    "f": "f",
+    "h": "h",
+    "i": "i",
+    "j": "j",
+    "p": "p",
+    "z": "z",
+    "en": "a",
+    "en-us": "a",
+    "en-us-x": "a",
+    "american-english": "a",
+    "us": "a",
+    "en-gb": "b",
+    "en-uk": "b",
+    "british-english": "b",
+    "uk": "b",
+    "es": "e",
+    "es-es": "e",
+    "spanish": "e",
+    "fr": "f",
+    "fr-fr": "f",
+    "french": "f",
+    "hi": "h",
+    "hi-in": "h",
+    "hindi": "h",
+    "it": "i",
+    "it-it": "i",
+    "italian": "i",
+    "ja": "j",
+    "ja-jp": "j",
+    "jp": "j",
+    "japanese": "j",
+    "pt": "p",
+    "pt-br": "p",
+    "pt-pt": "p",
+    "portuguese": "p",
+    "zh": "z",
+    "zh-cn": "z",
+    "zh-hans": "z",
+    "cmn": "z",
+    "mandarin": "z",
+    "chinese": "z",
+}
+
+
 def _normalize_language(language: Optional[str]) -> Optional[str]:
     if language is None:
         return None
@@ -264,6 +359,34 @@ def _normalize_language(language: Optional[str]) -> Optional[str]:
     if value.startswith("ar-"):
         return "arb"
     return value
+
+
+def _normalize_kokoro_language(language: Optional[str]) -> str:
+    if language is None:
+        return "a"
+    value = language.strip().lower().replace("_", "-")
+    if value in AUTO_LANGUAGE_VALUES:
+        return "a"
+    code = KOKORO_LANGUAGE_ALIASES.get(value)
+    if code is None:
+        supported = ", ".join(sorted(KOKORO_DEFAULT_VOICES))
+        raise HTTPException(
+            status_code=400,
+            detail=f"language/lang_code must map to a Kokoro code: {supported}.",
+        )
+    return code
+
+
+def _kokoro_preload_language_codes() -> list[str]:
+    codes: list[str] = []
+    for value in KOKORO_PRELOAD_LANGUAGES.split(","):
+        value = value.strip()
+        if not value:
+            continue
+        code = _normalize_kokoro_language(value)
+        if code not in codes:
+            codes.append(code)
+    return codes or ["a"]
 
 
 async def _get_cache_lock(key: str) -> asyncio.Lock:
@@ -630,6 +753,99 @@ def _write_silent_test_wav(output_path: Path) -> str:
     return ""
 
 
+def _kokoro_audio_to_array(audio: object) -> np.ndarray:
+    if hasattr(audio, "detach"):
+        audio = audio.detach().cpu().float().numpy()
+    return np.asarray(audio, dtype=np.float32).reshape(-1)
+
+
+def _get_kokoro_pipeline(lang_code: str) -> object:
+    global kokoro_model, kokoro_model_loaded, kokoro_load_error
+    with kokoro_load_lock:
+        cached = kokoro_pipelines.get(lang_code)
+        if cached is not None:
+            return cached
+        try:
+            from kokoro import KModel, KPipeline
+
+            if kokoro_model is None:
+                logger.info(
+                    "Loading Kokoro model=%s device=%s ...",
+                    KOKORO_MODEL_NAME,
+                    KOKORO_DEVICE,
+                )
+                kokoro_model = KModel(repo_id=KOKORO_MODEL_NAME).to(KOKORO_DEVICE).eval()
+                kokoro_model_loaded = True
+                kokoro_load_error = None
+                logger.info("Kokoro model loaded.")
+
+            pipeline = KPipeline(
+                lang_code=lang_code,
+                repo_id=KOKORO_MODEL_NAME,
+                model=kokoro_model,
+            )
+            kokoro_pipelines[lang_code] = pipeline
+            logger.info("Kokoro pipeline loaded: lang_code=%s", lang_code)
+            return pipeline
+        except Exception as exc:
+            kokoro_load_error = repr(exc)
+            logger.exception("Failed to load Kokoro pipeline lang_code=%s.", lang_code)
+            raise
+
+
+def _warmup_kokoro_pipeline(lang_code: str) -> None:
+    import torch
+
+    pipeline = _get_kokoro_pipeline(lang_code)
+    voice = KOKORO_DEFAULT_VOICES[lang_code]
+    text = KOKORO_WARMUP_TEXTS[lang_code]
+    logger.info("Kokoro warmup start: lang_code=%s voice=%s", lang_code, voice)
+    started = time.monotonic()
+    with torch.inference_mode():
+        list(pipeline(text, voice=voice, speed=1.0, split_pattern=None))
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    logger.info(
+        "Kokoro warmup done: lang_code=%s voice=%s elapsed=%.1fms",
+        lang_code,
+        voice,
+        (time.monotonic() - started) * 1000,
+    )
+
+
+def _generate_kokoro_wav(text: str, req: KokoroTTSRequest, output_wav: Path) -> str:
+    import torch
+
+    lang_code = req.lang_code or "a"
+    voice = req.voice or KOKORO_DEFAULT_VOICES[lang_code]
+    speed = req.speed if req.speed is not None else 1.0
+    pipeline = _get_kokoro_pipeline(lang_code)
+
+    logger.info(
+        "Kokoro chunk generate: lang_code=%s voice=%s chars=%d",
+        lang_code,
+        voice,
+        len(text),
+    )
+    gen_start = time.monotonic()
+    with torch.inference_mode():
+        outputs = list(pipeline(text, voice=voice, speed=speed, split_pattern=None))
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    parts = [_kokoro_audio_to_array(output.audio) for output in outputs]
+    if not parts:
+        raise RuntimeError("Kokoro returned no audio.")
+    audio = np.concatenate(parts)
+    sf.write(str(output_wav), audio, KOKORO_SAMPLE_RATE)
+    logger.info(
+        "Kokoro chunk done: lang_code=%s voice=%s generate=%.1fms",
+        lang_code,
+        voice,
+        (time.monotonic() - gen_start) * 1000,
+    )
+    return ""
+
+
 def _convert_wav_to_mp3(wav_path: Path, mp3_path: Path) -> None:
     if shutil.which("ffmpeg") is None:
         raise RuntimeError("ffmpeg is required for format=mp3 but was not found.")
@@ -716,6 +932,13 @@ async def _get_runtime_metrics() -> dict[str, object]:
             "succeeded": sum(1 for job in tts_jobs.values() if job.status == "succeeded"),
             "failed": sum(1 for job in tts_jobs.values() if job.status == "failed"),
         }
+        job_counts_by_provider: dict[str, dict[str, int]] = {}
+        for job in tts_jobs.values():
+            provider_counts = job_counts_by_provider.setdefault(
+                job.provider,
+                {"queued": 0, "running": 0, "succeeded": 0, "failed": 0},
+            )
+            provider_counts[job.status] = provider_counts.get(job.status, 0) + 1
         active_tts_jobs = job_counts["queued"] + job_counts["running"]
 
     async with metrics_lock:
@@ -737,6 +960,7 @@ async def _get_runtime_metrics() -> dict[str, object]:
             "voice_clone_prompt_cache_size": len(voice_prompt_cache),
             "voice_clone_prompt_cache_max_size": PROMPT_CACHE_SIZE,
             "tts_jobs": job_counts,
+            "tts_jobs_by_provider": job_counts_by_provider,
         }
 
 
@@ -958,6 +1182,83 @@ async def _generate_per_chunk_audio(
     return chunk_wav_paths, "audio/wav", transcript
 
 
+async def _generate_kokoro_chunk_audio(
+    request_id: str,
+    req: KokoroTTSRequest,
+    chunk_index: int,
+    chunk_text: str,
+    output_wav: Path,
+) -> Path:
+    async with kokoro_generation_semaphore:
+        await _queued_generation_delta(-1)
+        await _active_generation_batch_delta(1)
+        await _active_generation_delta(1)
+        try:
+            if SKIP_MODEL_LOAD:
+                await asyncio.to_thread(_write_silent_test_wav, output_wav)
+            else:
+                await _run_gpu_operation_with_oom_retry(
+                    "Kokoro chunk",
+                    lambda: asyncio.to_thread(_generate_kokoro_wav, chunk_text, req, output_wav),
+                )
+            await _increment_job_chunks(request_id, completed=1)
+            return output_wav
+        except Exception:
+            await _increment_job_chunks(request_id, failed=1)
+            raise
+        finally:
+            await _active_generation_delta(-1)
+            await _active_generation_batch_delta(-1)
+
+
+async def _generate_kokoro_per_chunk_audio(
+    request_id: str,
+    req: KokoroTTSRequest,
+    chunks: list[str],
+    cleanup_paths: list[Path],
+) -> tuple[list[Path], str]:
+    chunk_wav_paths: list[Path] = []
+    tasks: list[asyncio.Task[Path]] = []
+    for chunk_index, chunk_text in enumerate(chunks):
+        chunk_wav = Path(
+            tempfile.NamedTemporaryFile(delete=False, suffix=".wav", dir=TMP_DIR).name
+        )
+        cleanup_paths.append(chunk_wav)
+        chunk_wav_paths.append(chunk_wav)
+        tasks.append(
+            asyncio.create_task(
+                _generate_kokoro_chunk_audio(
+                    request_id,
+                    req,
+                    chunk_index,
+                    chunk_text,
+                    chunk_wav,
+                )
+            )
+        )
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    errors = [result for result in results if isinstance(result, Exception)]
+    if errors:
+        raise RuntimeError(f"{len(errors)} Kokoro chunk(s) failed; first error: {errors[0]!r}")
+
+    if req.format == "mp3":
+        chunk_output_paths: list[Path] = []
+        for chunk_wav in chunk_wav_paths:
+            chunk_mp3 = Path(
+                tempfile.NamedTemporaryFile(delete=False, suffix=".mp3", dir=TMP_DIR).name
+            )
+            cleanup_paths.append(chunk_mp3)
+            await asyncio.to_thread(_convert_wav_to_mp3, chunk_wav, chunk_mp3)
+            chunk_output_paths.append(chunk_mp3)
+        _remove_files(chunk_wav_paths)
+        wav_set = set(chunk_wav_paths)
+        cleanup_paths[:] = [p for p in cleanup_paths if p not in wav_set]
+        return chunk_output_paths, "audio/mpeg"
+
+    return chunk_wav_paths, "audio/wav"
+
+
 def _remove_files(paths: list[Path]) -> None:
     for path in paths:
         try:
@@ -976,19 +1277,29 @@ async def _set_job_state(request_id: str, **updates: object) -> None:
         job.updated_at = time.time()
 
 
+def _job_route_base(job: TTSJob) -> str:
+    if job.provider == "kokoro":
+        return "/v1/tts/kokoro/jobs"
+    return "/v1/tts/jobs"
+
+
 def _job_payload(job: TTSJob) -> dict[str, object]:
+    route_base = _job_route_base(job)
     payload: dict[str, object] = {
         "request_id": job.request_id,
         "status": job.status,
         "created_at": job.created_at,
         "updated_at": job.updated_at,
-        "status_url": f"/v1/tts/jobs/{job.request_id}",
+        "status_url": f"{route_base}/{job.request_id}",
+        "provider": job.provider,
         "language": job.language,
         "input_chars": job.input_chars,
         "chunks_total": job.chunks_total,
         "chunks_completed": job.chunks_completed,
         "chunks_failed": job.chunks_failed,
     }
+    if job.voice:
+        payload["voice"] = job.voice
     if job.detail:
         payload["detail"] = job.detail
     if job.audio_cache_hit is not None:
@@ -997,7 +1308,7 @@ def _job_payload(job: TTSJob) -> dict[str, object]:
         payload.update(
             {
                 "format": job.format,
-                "audio_url": f"/v1/tts/jobs/{job.request_id}/audio",
+                "audio_url": f"{route_base}/{job.request_id}/audio",
                 "transcript": job.transcript,
             }
         )
@@ -1082,6 +1393,58 @@ async def _run_tts_job(request_id: str, req: TTSRequest) -> None:
         logger.exception("TTS async job %s failed", request_id)
 
 
+async def _run_kokoro_tts_job(request_id: str, req: KokoroTTSRequest) -> None:
+    await _set_job_state(request_id, status="running", detail=None)
+    cleanup_paths: list[Path] = []
+
+    try:
+        chunk_output_paths, media_type = await _generate_kokoro_per_chunk_audio(
+            request_id,
+            req,
+            req.chunks,
+            cleanup_paths,
+        )
+
+        ext = "mp3" if req.format == "mp3" else "wav"
+        final_chunk_paths: list[Path] = []
+        for i, src_path in enumerate(chunk_output_paths):
+            dst_path = JOB_DIR / f"{request_id}_kokoro_chunk{i}.{ext}"
+            src_path.replace(dst_path)
+            cleanup_paths = [p for p in cleanup_paths if p != src_path]
+            cleanup_paths.append(dst_path)
+            final_chunk_paths.append(dst_path)
+
+        await _set_job_state(
+            request_id,
+            status="succeeded",
+            detail=None,
+            chunk_paths=final_chunk_paths,
+            chunk_media_type=media_type,
+            transcript="",
+            audio_cache_hit=False,
+            cleanup_paths=cleanup_paths,
+        )
+        logger.info(
+            "Kokoro async job %s succeeded (%d chunks lang_code=%s voice=%s)",
+            request_id,
+            len(final_chunk_paths),
+            req.lang_code,
+            req.voice,
+        )
+    except Exception as exc:
+        unfinished = await _fail_unfinished_job_chunks(request_id)
+        if unfinished:
+            await _queued_generation_delta(-unfinished)
+        _remove_files(cleanup_paths)
+        await _set_job_state(
+            request_id,
+            status="failed",
+            detail=f"Kokoro generation failed: {exc}",
+            cleanup_paths=[],
+        )
+        logger.exception("Kokoro async job %s failed", request_id)
+
+
 def _validate_token(authorization: Optional[str] = Header(default=None)) -> None:
     if not API_TOKEN:
         raise HTTPException(status_code=500, detail="API_TOKEN is not configured.")
@@ -1112,11 +1475,37 @@ def _validate_request(req: TTSRequest) -> None:
         raise HTTPException(status_code=400, detail="guidance_scale must be between 0.0 and 4.0.")
 
 
+def _validate_kokoro_request(req: KokoroTTSRequest) -> None:
+    req.format = req.format.lower().strip()
+    if req.format not in SUPPORTED_FORMATS:
+        raise HTTPException(status_code=400, detail="format must be wav or mp3.")
+    if not req.chunks or not any(c.strip() for c in req.chunks):
+        raise HTTPException(status_code=400, detail="chunks is required and must contain non-empty strings.")
+    req.chunks = [c.strip() for c in req.chunks if c.strip()]
+    lang_code = _normalize_kokoro_language(req.lang_code or req.language)
+    req.lang_code = lang_code
+    req.language = lang_code
+    if not req.voice or not req.voice.strip():
+        req.voice = KOKORO_DEFAULT_VOICES[lang_code]
+    else:
+        req.voice = req.voice.strip()
+    if req.speed is None:
+        req.speed = 1.0
+    if req.speed < 0.5 or req.speed > 2.0:
+        raise HTTPException(status_code=400, detail="speed must be between 0.5 and 2.0.")
+
+
 @app.on_event("startup")
 async def startup() -> None:
     global generation_batch_worker_task, job_cleanup_task
     _ensure_dirs()
     await asyncio.to_thread(_load_model)
+    if KOKORO_PRELOAD and not SKIP_MODEL_LOAD:
+        for lang_code in _kokoro_preload_language_codes():
+            if KOKORO_WARMUP:
+                await asyncio.to_thread(_warmup_kokoro_pipeline, lang_code)
+            else:
+                await asyncio.to_thread(_get_kokoro_pipeline, lang_code)
     generation_batch_worker_task = asyncio.create_task(_generation_batch_worker())
     logger.info(
         "OmniVoice chunk scheduler started: batch_size=%s max_wait_ms=%s busy_backlog_chunks=%s.",
@@ -1162,6 +1551,17 @@ async def health() -> dict[str, object]:
         "cache_audio_count": len(list(REF_AUDIO_DIR.glob("*"))),
         "cache_transcript_count": len(list(TRANSCRIPT_DIR.glob("*.json"))),
         "acceleration": ACCELERATION,
+        "kokoro": {
+            "model": KOKORO_MODEL_NAME,
+            "model_loaded": kokoro_model_loaded,
+            "device": KOKORO_DEVICE,
+            "concurrency": KOKORO_CONCURRENCY,
+            "preload": KOKORO_PRELOAD,
+            "preload_languages": KOKORO_PRELOAD_LANGUAGES,
+            "warmup": KOKORO_WARMUP,
+            "pipelines_loaded": sorted(kokoro_pipelines),
+            "load_error": kokoro_load_error,
+        },
         **runtime_metrics,
     }
 
@@ -1237,27 +1637,79 @@ async def tts(
     )
 
 
-@app.get("/v1/tts/jobs/{request_id}")
-async def get_tts_job(
-    request_id: str,
+@app.post("/v1/tts/kokoro")
+async def kokoro_tts(
+    req: KokoroTTSRequest,
+    background_tasks: BackgroundTasks,
     _: None = Depends(_validate_token),
+) -> JSONResponse:
+    _validate_kokoro_request(req)
+    chunks = req.chunks
+
+    reserved, outstanding_chunks = await _try_reserve_generation_chunks(len(chunks))
+    if not reserved:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "TTS chunk backlog is busy; retry later. "
+                f"outstanding_chunks={outstanding_chunks}, requested_chunks={len(chunks)}, "
+                f"limit={BUSY_BACKLOG_CHUNKS}."
+            ),
+            headers={
+                "Retry-After": "1",
+                "X-Busy-Backlog-Chunks": str(BUSY_BACKLOG_CHUNKS),
+                "X-Outstanding-Chunks": str(outstanding_chunks),
+                "X-Requested-Chunks": str(len(chunks)),
+            },
+        )
+
+    request_id = str(uuid.uuid4())
+    now = time.time()
+    job = TTSJob(
+        request_id=request_id,
+        status="queued",
+        created_at=now,
+        updated_at=now,
+        format=req.format,
+        provider="kokoro",
+        language=req.lang_code,
+        voice=req.voice,
+        chunks_total=len(chunks),
+        input_chars=sum(len(c) for c in chunks),
+    )
+    async with tts_jobs_lock:
+        tts_jobs[request_id] = job
+
+    background_tasks.add_task(_run_kokoro_tts_job, request_id, req)
+    return JSONResponse(
+        status_code=202,
+        content=_job_payload(job),
+        headers={
+            "X-Request-Id": request_id,
+            "Location": f"/v1/tts/kokoro/jobs/{request_id}",
+        },
+    )
+
+
+async def _get_tts_job_response(
+    request_id: str,
+    provider: Optional[str] = None,
 ) -> JSONResponse:
     async with tts_jobs_lock:
         job = tts_jobs.get(request_id)
-        if job is None:
+        if job is None or (provider is not None and job.provider != provider):
             raise HTTPException(status_code=404, detail="TTS job not found.")
         payload = _job_payload(job)
     return JSONResponse(content=payload)
 
 
-@app.get("/v1/tts/jobs/{request_id}/audio")
-async def get_tts_job_audio(
+async def _get_tts_job_audio_response(
     request_id: str,
-    _: None = Depends(_validate_token),
+    provider: Optional[str] = None,
 ) -> Response:
     async with tts_jobs_lock:
         job = tts_jobs.get(request_id)
-        if job is None:
+        if job is None or (provider is not None and job.provider != provider):
             raise HTTPException(status_code=404, detail="TTS job not found.")
         if job.status != "succeeded":
             raise HTTPException(status_code=409, detail=f"TTS job is {job.status}.")
@@ -1296,3 +1748,35 @@ async def get_tts_job_audio(
         media_type="application/octet-stream",
         headers=headers,
     )
+
+
+@app.get("/v1/tts/jobs/{request_id}")
+async def get_tts_job(
+    request_id: str,
+    _: None = Depends(_validate_token),
+) -> JSONResponse:
+    return await _get_tts_job_response(request_id)
+
+
+@app.get("/v1/tts/jobs/{request_id}/audio")
+async def get_tts_job_audio(
+    request_id: str,
+    _: None = Depends(_validate_token),
+) -> Response:
+    return await _get_tts_job_audio_response(request_id)
+
+
+@app.get("/v1/tts/kokoro/jobs/{request_id}")
+async def get_kokoro_tts_job(
+    request_id: str,
+    _: None = Depends(_validate_token),
+) -> JSONResponse:
+    return await _get_tts_job_response(request_id, provider="kokoro")
+
+
+@app.get("/v1/tts/kokoro/jobs/{request_id}/audio")
+async def get_kokoro_tts_job_audio(
+    request_id: str,
+    _: None = Depends(_validate_token),
+) -> Response:
+    return await _get_tts_job_audio_response(request_id, provider="kokoro")

@@ -1,5 +1,7 @@
 -r requirements-common.txt
 omnivoice>=0.1.5
+kokoro>=0.9.4
+misaki[en,ja,zh]>=0.9.4
 # omnivoice-triton requires triton>=3.4.0, but older torch cu121 pins triton==3.1.0.
 # Install it from the fork separately or with --no-deps in install_tts.sh.
 omnivoice-triton @ git+https://github.com/entermask/omnivoice-triton.git

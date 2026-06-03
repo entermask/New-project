@@ -56,7 +56,7 @@ install_python_312() {
 
 install_system_packages() {
   apt_update
-  apt_install ffmpeg tmux curl ca-certificates lsb-release build-essential gcc g++ ufw
+  apt_install ffmpeg tmux curl ca-certificates lsb-release build-essential gcc g++ ufw espeak-ng libsndfile1
 }
 
 configure_firewall() {
@@ -122,6 +122,7 @@ fi
 
 python -m pip install -r requirements-tts.txt
 python -m pip install git+https://github.com/entermask/omnivoice-triton.git --no-deps
+python -m unidic download || echo "Warning: unidic download failed; Kokoro Japanese may fail until it is installed." >&2
 
 if [ ! -f .env ]; then
   cp .env.tts.example .env

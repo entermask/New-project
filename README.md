@@ -196,6 +196,63 @@ STATUS_URL=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["status_url
 curl -sS -H "Authorization: Bearer $API_TOKEN" "$BASE_URL$STATUS_URL"
 ```
 
+### `POST /v1/tts/kokoro`
+
+Kokoro uses the same async job shape as OmniVoice, but does not require reference audio. The request accepts `chunks`, not raw `text`.
+
+Request:
+
+```json
+{
+  "chunks": ["こんにちは。", "これはココロの日本語音声です。"],
+  "language": "ja",
+  "voice": "jf_alpha",
+  "speed": 1.0,
+  "format": "wav"
+}
+```
+
+Required fields: `chunks`.
+
+Defaults:
+
+```text
+language=auto/en-us -> Kokoro code a
+voice omitted -> default voice for the resolved Kokoro language
+speed=1.0
+format=wav
+```
+
+Supported Kokoro language mappings:
+
+```text
+a/en-us -> af_heart
+b/en-gb -> bf_emma
+e/es    -> ef_dora
+f/fr    -> ff_siwis
+h/hi    -> hf_alpha
+i/it    -> if_sara
+j/ja    -> jf_alpha
+p/pt    -> pf_dora
+z/zh    -> zf_xiaobei
+```
+
+Submit and poll:
+
+```bash
+JOB_JSON=$(curl -sS -X POST "$BASE_URL/v1/tts/kokoro" \
+  -H "Authorization: Bearer $API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"chunks":["こんにちは。","これはココロの日本語音声です。"],"language":"ja","format":"wav"}')
+
+STATUS_URL=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["status_url"])' <<< "$JOB_JSON")
+curl -sS -H "Authorization: Bearer $API_TOKEN" "$BASE_URL$STATUS_URL"
+```
+
+When the job succeeds, download the audio stream from `audio_url`. It uses the same length-prefixed binary stream format as `/v1/tts`.
+
+Kokoro preloads and warms up all supported language pipelines by default. Set `KOKORO_PRELOAD_LANGUAGES=j,z` to warm only selected languages, or keep `a,b,e,f,h,i,j,p,z` for full coverage.
+
 ## Cache
 
 Set `OMNIVOICE_CACHE_DIR`, default `/ephemeral/omnivoice-cache`.
@@ -212,7 +269,7 @@ If `ref_text` is provided, it is used and written to transcript cache. If `ref_t
 
 ## Chunked TTS Scheduler
 
-`/v1/tts` is the only public TTS endpoint. Every request becomes one logical TTS job. The server splits the input text into small chunks, creates one `voice_clone_prompt` for the job, generates chunk audio in GPU batches, then merges chunks into the final audio file.
+`/v1/tts` and `/v1/tts/kokoro` both create one logical TTS job from caller-provided chunks. OmniVoice creates one `voice_clone_prompt` for the job and generates compatible chunks in GPU batches. Kokoro runs chunk generation through its own async worker path with `KOKORO_CONCURRENCY`.
 
 ```text
 OMNIVOICE_BATCH_SIZE=12
