@@ -182,7 +182,7 @@ Audio files are streamed in bounded blocks instead of reading whole chunks into 
 
 See `MIGRATION_CHUNKS_API.md` for full client integration guide with Node.js examples.
 
-Completed job metadata and audio files are kept for `OMNIVOICE_JOB_TTL_SECONDS`, default `3600`.
+Generated job audio is deleted only after the server fully streams it to the client. If the client disconnects before the stream completes, the audio remains available for retry. Jobs that never complete a stream are kept for `OMNIVOICE_JOB_TTL_SECONDS`, default `3600`, and the cleanup batch runs every `OMNIVOICE_JOB_CLEANUP_INTERVAL_SECONDS`, default `600`.
 
 Example:
 
@@ -278,6 +278,7 @@ KOKORO_CONCURRENCY=1
 KOKORO_BUSY_BACKLOG_CHUNKS=24
 OMNIVOICE_BATCH_MAX_WAIT_MS=50
 OMNIVOICE_JOB_TTL_SECONDS=3600
+OMNIVOICE_JOB_CLEANUP_INTERVAL_SECONDS=600
 ```
 
 Client is responsible for splitting text into chunks before submitting. See `MIGRATION_CHUNKS_API.md` for splitting guidelines (recommended: 150–250 chars per chunk, split at sentence boundaries).

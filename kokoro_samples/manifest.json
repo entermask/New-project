@@ -1,0 +1,110 @@
+[
+  {
+    "code": "a",
+    "tag": "en_us",
+    "name": "American English",
+    "voice": "af_heart",
+    "text": "Hello from Kokoro. This is an American English sample, with a short sentence and a longer sentence so you can hear the pacing, clarity, and natural pauses.",
+    "ok": true,
+    "filename": "kokoro_a_en_us_af_heart.wav",
+    "duration_s": 10.4,
+    "elapsed_s": 1.654,
+    "size_bytes": 499244
+  },
+  {
+    "code": "b",
+    "tag": "en_gb",
+    "name": "British English",
+    "voice": "bf_emma",
+    "text": "Hello from Kokoro. This is a British English sample, with a clear speaking style, steady rhythm, and a few natural pauses between phrases.",
+    "ok": true,
+    "filename": "kokoro_b_en_gb_bf_emma.wav",
+    "duration_s": 8.8,
+    "elapsed_s": 0.944,
+    "size_bytes": 422444
+  },
+  {
+    "code": "e",
+    "tag": "es",
+    "name": "Spanish",
+    "voice": "ef_dora",
+    "text": "Hola desde Kokoro. Esta es una muestra de voz en espanol, con una frase corta y otra un poco mas larga para escuchar el ritmo y la pronunciacion.",
+    "ok": true,
+    "filename": "kokoro_e_es_ef_dora.wav",
+    "duration_s": 8.25,
+    "elapsed_s": 0.41,
+    "size_bytes": 396044
+  },
+  {
+    "code": "f",
+    "tag": "fr",
+    "name": "French",
+    "voice": "ff_siwis",
+    "text": "Bonjour depuis Kokoro. Ceci est un exemple de voix en francais, avec une phrase courte et une phrase plus longue pour verifier le rythme et la prononciation.",
+    "ok": true,
+    "filename": "kokoro_f_fr_ff_siwis.wav",
+    "duration_s": 9.625,
+    "elapsed_s": 0.389,
+    "size_bytes": 462044
+  },
+  {
+    "code": "h",
+    "tag": "hi",
+    "name": "Hindi",
+    "voice": "hf_alpha",
+    "text": "नमस्ते, यह कोकोरो की हिंदी आवाज़ का नमूना है। हम छोटे और थोड़े लंबे वाक्य से उच्चारण, गति और रुकावटों को सुन रहे हैं।",
+    "ok": true,
+    "filename": "kokoro_h_hi_hf_alpha.wav",
+    "duration_s": 10.3,
+    "elapsed_s": 0.4,
+    "size_bytes": 494444
+  },
+  {
+    "code": "i",
+    "tag": "it",
+    "name": "Italian",
+    "voice": "if_sara",
+    "text": "Ciao da Kokoro. Questa e una prova della voce italiana, con una frase breve e una frase un po piu lunga per ascoltare ritmo e pronuncia.",
+    "ok": true,
+    "filename": "kokoro_i_it_if_sara.wav",
+    "duration_s": 8.1,
+    "elapsed_s": 0.416,
+    "size_bytes": 388844
+  },
+  {
+    "code": "j",
+    "tag": "ja",
+    "name": "Japanese",
+    "voice": "jf_alpha",
+    "text": "こんにちは。これはココロの日本語音声サンプルです。短い文章と少し長い文章で、発音、速度、自然な間を確認しています。",
+    "ok": true,
+    "filename": "kokoro_j_ja_jf_alpha.wav",
+    "duration_s": 10.675,
+    "elapsed_s": 0.443,
+    "size_bytes": 512444
+  },
+  {
+    "code": "p",
+    "tag": "pt",
+    "name": "Portuguese",
+    "voice": "pf_dora",
+    "text": "Ola do Kokoro. Esta e uma amostra de voz em portugues, com uma frase curta e outra um pouco mais longa para ouvir o ritmo e a pronuncia.",
+    "ok": true,
+    "filename": "kokoro_p_pt_pf_dora.wav",
+    "duration_s": 7.8,
+    "elapsed_s": 0.422,
+    "size_bytes": 374444
+  },
+  {
+    "code": "z",
+    "tag": "zh",
+    "name": "Mandarin Chinese",
+    "voice": "zf_xiaobei",
+    "text": "你好，这是 Kokoro 的中文语音样本。我们用短句和稍长的句子来检查发音、语速和自然停顿。",
+    "ok": true,
+    "filename": "kokoro_z_zh_zf_xiaobei.wav",
+    "duration_s": 9.825,
+    "elapsed_s": 1.187,
+    "size_bytes": 471644
+  }
+]

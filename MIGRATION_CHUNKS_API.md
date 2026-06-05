@@ -258,4 +258,4 @@ const chunks = splitTextForTTS(text);
 | `401` | Token sai |
 | `429` | Server busy — retry sau `Retry-After` header |
 | `409` | Job chưa hoàn tất (poll audio trước khi succeeded) |
-| `410` | Audio đã expired (quá `JOB_TTL_SECONDS`) |
+| `410` | Audio đã expired (đã stream hoàn tất và bị xoá, hoặc quá `JOB_TTL_SECONDS` mà chưa stream hoàn tất) |

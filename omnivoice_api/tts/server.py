@@ -68,7 +68,10 @@ KOKORO_BUSY_BACKLOG_CHUNKS = max(
     int(os.getenv("KOKORO_BUSY_BACKLOG_CHUNKS", str(BUSY_BACKLOG_CHUNKS))),
 )
 PROMPT_CACHE_SIZE = max(1, int(os.getenv("OMNIVOICE_PROMPT_CACHE_SIZE", "64")))
-JOB_CLEANUP_INTERVAL_SECONDS = 60
+JOB_CLEANUP_INTERVAL_SECONDS = max(
+    1,
+    int(os.getenv("OMNIVOICE_JOB_CLEANUP_INTERVAL_SECONDS", "600")),
+)
 STREAM_CHUNK_SIZE_BYTES = max(16 * 1024, int(os.getenv("OMNIVOICE_STREAM_CHUNK_SIZE_BYTES", str(1024 * 1024))))
 
 SUPPORTED_FORMATS = {"wav", "mp3"}
@@ -171,6 +174,9 @@ class TTSJob:
     transcript: str = ""
     audio_cache_hit: Optional[bool] = None
     cleanup_paths: Optional[list[Path]] = None
+    active_audio_streams: int = 0
+    audio_stream_completed: bool = False
+    audio_deleted_at: Optional[float] = None
     chunks_total: int = 0
     chunks_completed: int = 0
     chunks_failed: int = 0
@@ -1302,12 +1308,32 @@ async def _generate_kokoro_per_chunk_audio(
     return chunk_wav_paths, "audio/wav"
 
 
-def _remove_files(paths: list[Path]) -> None:
+def _dedupe_paths(paths: list[Path]) -> list[Path]:
+    unique_paths: list[Path] = []
+    seen: set[Path] = set()
     for path in paths:
+        if path in seen:
+            continue
+        unique_paths.append(path)
+        seen.add(path)
+    return unique_paths
+
+
+def _remove_files(paths: list[Path]) -> None:
+    for path in _dedupe_paths(paths):
         try:
             path.unlink(missing_ok=True)
         except OSError as exc:
             logger.warning("Could not remove temp file %s: %s", path, exc)
+
+
+def _detach_job_audio_paths(job: TTSJob, deleted_at: float) -> list[Path]:
+    cleanup_paths = list(job.cleanup_paths or job.chunk_paths or [])
+    job.chunk_paths = None
+    job.cleanup_paths = []
+    job.audio_deleted_at = deleted_at
+    job.updated_at = deleted_at
+    return cleanup_paths
 
 
 async def _set_job_state(request_id: str, **updates: object) -> None:
@@ -1351,10 +1377,15 @@ def _job_payload(job: TTSJob) -> dict[str, object]:
         payload.update(
             {
                 "format": job.format,
-                "audio_url": f"{route_base}/{job.request_id}/audio",
                 "transcript": job.transcript,
             }
         )
+        if job.chunk_paths:
+            payload["audio_url"] = f"{route_base}/{job.request_id}/audio"
+        else:
+            payload["audio_expired"] = True
+            if job.audio_deleted_at is not None:
+                payload["audio_deleted_at"] = job.audio_deleted_at
     return payload
 
 
@@ -1367,14 +1398,17 @@ async def _cleanup_expired_jobs() -> None:
         for request_id, job in list(tts_jobs.items()):
             if job.status in {"queued", "running"}:
                 continue
-            if now - job.updated_at <= JOB_TTL_SECONDS:
+            if job.active_audio_streams > 0:
+                continue
+            if now - job.updated_at < JOB_TTL_SECONDS:
                 continue
             expired.append(job)
             del tts_jobs[request_id]
 
     for job in expired:
-        if job.cleanup_paths:
-            _remove_files(job.cleanup_paths)
+        cleanup_paths = list(job.cleanup_paths or job.chunk_paths or [])
+        if cleanup_paths:
+            _remove_files(cleanup_paths)
     if expired:
         logger.info("Cleaned up %d expired TTS jobs.", len(expired))
 
@@ -1568,6 +1602,12 @@ async def shutdown() -> None:
             await generation_batch_worker_task
         except asyncio.CancelledError:
             pass
+    if job_cleanup_task is not None:
+        job_cleanup_task.cancel()
+        try:
+            await job_cleanup_task
+        except asyncio.CancelledError:
+            pass
 
 
 @app.get("/health")
@@ -1753,10 +1793,10 @@ async def _get_tts_job_response(
     return JSONResponse(content=payload)
 
 
-async def _get_tts_job_audio_response(
+async def _begin_tts_job_audio_stream(
     request_id: str,
     provider: Optional[str] = None,
-) -> Response:
+) -> tuple[list[Path], str, str, Optional[bool]]:
     async with tts_jobs_lock:
         job = tts_jobs.get(request_id)
         if job is None or (provider is not None and job.provider != provider):
@@ -1764,26 +1804,69 @@ async def _get_tts_job_audio_response(
         if job.status != "succeeded":
             raise HTTPException(status_code=409, detail=f"TTS job is {job.status}.")
         if not job.chunk_paths:
-            raise HTTPException(status_code=500, detail="TTS job audio is missing.")
-        chunk_paths = list(job.chunk_paths)
-        media_type = job.chunk_media_type or "audio/wav"
-        transcript = job.transcript
-        cache_hit = job.audio_cache_hit
+            raise HTTPException(status_code=410, detail="TTS job audio expired.")
+
+        job.active_audio_streams += 1
+        return (
+            list(job.chunk_paths),
+            job.chunk_media_type or "audio/wav",
+            job.transcript,
+            job.audio_cache_hit,
+        )
+
+
+async def _finish_tts_job_audio_stream(request_id: str, stream_completed: bool) -> None:
+    cleanup_paths: list[Path] = []
+    deleted_at = time.time()
+    async with tts_jobs_lock:
+        job = tts_jobs.get(request_id)
+        if job is None:
+            return
+        if job.active_audio_streams > 0:
+            job.active_audio_streams -= 1
+        if stream_completed:
+            job.audio_stream_completed = True
+        if job.audio_stream_completed and job.active_audio_streams == 0 and job.chunk_paths:
+            cleanup_paths = _detach_job_audio_paths(job, deleted_at)
+
+    if cleanup_paths:
+        _remove_files(cleanup_paths)
+        logger.info(
+            "Deleted fully streamed TTS job audio: request_id=%s files=%d",
+            request_id,
+            len(_dedupe_paths(cleanup_paths)),
+        )
+
+
+async def _get_tts_job_audio_response(
+    request_id: str,
+    provider: Optional[str] = None,
+) -> Response:
+    chunk_paths, media_type, transcript, cache_hit = await _begin_tts_job_audio_stream(
+        request_id,
+        provider,
+    )
 
     for path in chunk_paths:
         if not path.exists():
+            await _finish_tts_job_audio_stream(request_id, stream_completed=False)
             raise HTTPException(status_code=410, detail="TTS job audio expired.")
 
     async def stream_length_prefixed():
-        yield len(chunk_paths).to_bytes(4, "big")
-        for path in chunk_paths:
-            yield path.stat().st_size.to_bytes(4, "big")
-            with path.open("rb") as handle:
-                while True:
-                    block = handle.read(STREAM_CHUNK_SIZE_BYTES)
-                    if not block:
-                        break
-                    yield block
+        stream_completed = False
+        try:
+            yield len(chunk_paths).to_bytes(4, "big")
+            for path in chunk_paths:
+                yield path.stat().st_size.to_bytes(4, "big")
+                with path.open("rb") as handle:
+                    while True:
+                        block = handle.read(STREAM_CHUNK_SIZE_BYTES)
+                        if not block:
+                            break
+                        yield block
+            stream_completed = True
+        finally:
+            await _finish_tts_job_audio_stream(request_id, stream_completed=stream_completed)
 
     headers = {
         "X-Request-Id": request_id,
