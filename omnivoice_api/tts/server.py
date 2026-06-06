@@ -48,6 +48,7 @@ CACHE_DIR = Path(os.getenv("OMNIVOICE_CACHE_DIR", "/ephemeral/omnivoice-cache"))
 DOWNLOAD_TIMEOUT = float(os.getenv("OMNIVOICE_DOWNLOAD_TIMEOUT", "60"))
 REQUEST_TIMEOUT = float(os.getenv("OMNIVOICE_REQUEST_TIMEOUT", "300"))
 JOB_TTL_SECONDS = int(os.getenv("OMNIVOICE_JOB_TTL_SECONDS", "3600"))
+STREAMED_JOB_TTL_SECONDS = int(os.getenv("OMNIVOICE_STREAMED_JOB_TTL_SECONDS", "600"))
 SKIP_MODEL_LOAD = os.getenv("OMNIVOICE_SKIP_MODEL_LOAD", "0") == "1"
 GPU_PROFILE = os.getenv("OMNIVOICE_GPU_PROFILE", "auto").lower().strip()
 MODEL_DTYPE = os.getenv("OMNIVOICE_DTYPE", "fp16").lower().strip()
@@ -176,6 +177,7 @@ class TTSJob:
     cleanup_paths: Optional[list[Path]] = None
     active_audio_streams: int = 0
     audio_stream_completed: bool = False
+    audio_stream_completed_at: Optional[float] = None
     audio_deleted_at: Optional[float] = None
     chunks_total: int = 0
     chunks_completed: int = 0
@@ -1390,7 +1392,7 @@ def _job_payload(job: TTSJob) -> dict[str, object]:
 
 
 async def _cleanup_expired_jobs() -> None:
-    if JOB_TTL_SECONDS <= 0:
+    if JOB_TTL_SECONDS <= 0 and STREAMED_JOB_TTL_SECONDS <= 0:
         return
     now = time.time()
     expired: list[TTSJob] = []
@@ -1400,7 +1402,18 @@ async def _cleanup_expired_jobs() -> None:
                 continue
             if job.active_audio_streams > 0:
                 continue
-            if now - job.updated_at < JOB_TTL_SECONDS:
+
+            if job.audio_stream_completed_at is not None:
+                if STREAMED_JOB_TTL_SECONDS <= 0:
+                    expires_at = job.audio_stream_completed_at
+                else:
+                    expires_at = job.audio_stream_completed_at + STREAMED_JOB_TTL_SECONDS
+            elif JOB_TTL_SECONDS <= 0:
+                continue
+            else:
+                expires_at = job.updated_at + JOB_TTL_SECONDS
+
+            if now < expires_at:
                 continue
             expired.append(job)
             del tts_jobs[request_id]
@@ -1816,8 +1829,7 @@ async def _begin_tts_job_audio_stream(
 
 
 async def _finish_tts_job_audio_stream(request_id: str, stream_completed: bool) -> None:
-    cleanup_paths: list[Path] = []
-    deleted_at = time.time()
+    completed_at = time.time()
     async with tts_jobs_lock:
         job = tts_jobs.get(request_id)
         if job is None:
@@ -1826,16 +1838,13 @@ async def _finish_tts_job_audio_stream(request_id: str, stream_completed: bool) 
             job.active_audio_streams -= 1
         if stream_completed:
             job.audio_stream_completed = True
-        if job.audio_stream_completed and job.active_audio_streams == 0 and job.chunk_paths:
-            cleanup_paths = _detach_job_audio_paths(job, deleted_at)
-
-    if cleanup_paths:
-        _remove_files(cleanup_paths)
-        logger.info(
-            "Deleted fully streamed TTS job audio: request_id=%s files=%d",
-            request_id,
-            len(_dedupe_paths(cleanup_paths)),
-        )
+            job.audio_stream_completed_at = completed_at
+            job.updated_at = completed_at
+            logger.info(
+                "TTS job audio fully streamed; eligible for cleanup: request_id=%s ttl_seconds=%d",
+                request_id,
+                STREAMED_JOB_TTL_SECONDS,
+            )
 
 
 async def _get_tts_job_audio_response(
